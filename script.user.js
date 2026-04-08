@@ -102,7 +102,11 @@
         "80": { name: "นราธิวาส", file: "96-NTW.geojson" }
     };
 
+    const FRAME_BUDGET_MS = 12;
+    const LABEL_MIN_ZOOM = 15;
+
     let tambonLayer = null;
+    let activeLoadToken = 0;
 
     if (W?.userscripts?.state?.isInitialized) {
         init();
@@ -207,13 +211,17 @@ tabPane.innerHTML = `
         });
 
         btnClear.addEventListener('click', () => {
+            // ยกเลิกงานที่กำลังโหลด/ประมวลผลอยู่
+            activeLoadToken += 1;
+
             if (tambonLayer) {
                 W.map.removeLayer(tambonLayer);
                 tambonLayer.destroy();
                 tambonLayer = null;
-                statusDiv.innerText = "สถานะ: ลบเส้นแล้ว";
-                progressContainer.style.display = "none";
             }
+
+            statusDiv.innerText = "สถานะ: ลบเส้นแล้ว";
+            progressContainer.style.display = "none";
         });
     }
 
@@ -242,6 +250,7 @@ tabPane.innerHTML = `
     }
 
     function loadBoundary(provinceKey, filename, statusDiv, ui) {
+        const loadToken = ++activeLoadToken;
         const url = DATA_BASE_URL + filename;
 
         if (tambonLayer) {
@@ -252,43 +261,68 @@ tabPane.innerHTML = `
 
         fetchGM(url)
             .then(data => {
+                if (loadToken !== activeLoadToken) return;
                 statusDiv.innerText = "กำลังประมวลผล...";
-                drawLayerWithProgress(data, provinceKey, statusDiv, ui);
+                drawLayerWithProgress(data, provinceKey, statusDiv, ui, loadToken);
             })
             .catch(err => {
+                if (loadToken !== activeLoadToken) return;
                 console.error("Load Error:", err);
                 statusDiv.innerText = "❌ ผิดพลาด: " + err.message;
             });
     }
 
     // Progress & ETA
-    function drawLayerWithProgress(geoJsonData, provinceKey, statusDiv, ui) {
-        const allFeatures = geoJsonData.features;
+    function drawLayerWithProgress(geoJsonData, provinceKey, statusDiv, ui, loadToken) {
+        const allFeatures = Array.isArray(geoJsonData?.features) ? geoJsonData.features : [];
         const total = allFeatures.length;
-        const processedFeatures = [];
-        const labelField = (provinceKey === "0") ? "${ADM2_TH}" : "${ADM3_TH}, ${ADM2_TH}";
 
-        const BATCH_SIZE = 50;
+        if (total === 0) {
+            statusDiv.innerText = "❌ ไม่พบข้อมูลพื้นที่ในไฟล์";
+            ui.bar.style.width = "0%";
+            ui.text.innerText = "0%";
+            ui.eta.innerText = "--:--";
+            return;
+        }
+
+        tambonLayer = createBoundaryLayer(provinceKey);
+        W.map.addLayer(tambonLayer);
+        bringLayerToFront(tambonLayer);
+
+        if (tambonLayer.div) {
+            tambonLayer.div.style.pointerEvents = "none";
+            tambonLayer.div.style.background = "transparent";
+        }
+
         let index = 0;
+        let addedCount = 0;
         const startTime = performance.now();
 
         function processBatch() {
-            const batchStart = performance.now();
-            const end = Math.min(index + BATCH_SIZE, total);
+            if (loadToken !== activeLoadToken) return;
 
-            for (let i = index; i < end; i++) {
-                const f = allFeatures[i];
+            const frameStart = performance.now();
+            const batchFeatures = [];
+
+            while (index < total && (performance.now() - frameStart) < FRAME_BUDGET_MS) {
+                const f = allFeatures[index];
+                index += 1;
+
+                if (!f || !f.geometry) continue;
                 const olGeometry = W.userscripts.toOLGeometry(f.geometry);
                 if (olGeometry) {
-                    const feature = new OpenLayers.Feature.Vector(olGeometry, f.properties);
-                    processedFeatures.push(feature);
+                    const feature = new OpenLayers.Feature.Vector(olGeometry, f.properties || {});
+                    batchFeatures.push(feature);
                 }
             }
 
-            index = end;
+            if (batchFeatures.length && tambonLayer) {
+                tambonLayer.addFeatures(batchFeatures);
+                addedCount += batchFeatures.length;
+            }
 
             const now = performance.now();
-            const elapsed = (now - startTime) / 1000;
+            const elapsed = Math.max((now - startTime) / 1000, 0.001);
             const pct = Math.floor((index / total) * 100);
 
             ui.bar.style.width = pct + "%";
@@ -297,7 +331,7 @@ tabPane.innerHTML = `
             if (index > 0 && index < total) {
                 const rate = index / elapsed;
                 const remainingItems = total - index;
-                const etaSeconds = remainingItems / rate;
+                const etaSeconds = remainingItems / Math.max(rate, 0.001);
 
                 ui.eta.innerText = "เหลืออีก: " + formatTime(etaSeconds);
             } else if (index >= total) {
@@ -305,13 +339,21 @@ tabPane.innerHTML = `
             }
 
             if (index < total) {
-                setTimeout(processBatch, 0);
+                scheduleNextFrame(processBatch);
             } else {
-                finalizeLayer(processedFeatures, labelField, statusDiv);
+                finalizeLayer(addedCount, statusDiv);
             }
         }
 
         processBatch();
+    }
+
+    function scheduleNextFrame(cb) {
+        if (typeof requestAnimationFrame === "function") {
+            requestAnimationFrame(cb);
+        } else {
+            setTimeout(cb, 0);
+        }
     }
 
     function formatTime(seconds) {
@@ -322,14 +364,27 @@ tabPane.innerHTML = `
         return mins + " นาที " + secs + " วิ";
     }
 
-    function finalizeLayer(features, labelField, statusDiv) {
+    function createBoundaryLayer(provinceKey) {
+        const resolveLabel = (feature) => {
+            const attrs = feature?.attributes || {};
+
+            if (provinceKey === "0") {
+                return attrs.ADM2_TH || "";
+            }
+
+            const adm3 = attrs.ADM3_TH || "";
+            const adm2 = attrs.ADM2_TH || "";
+            if (adm3 && adm2) return adm3 + ", " + adm2;
+            return adm3 || adm2;
+        };
+
         const style = new OpenLayers.Style({
             strokeColor: "#FF0000",
             strokeOpacity: 0.8,
             strokeWidth: 2,
             fillColor: "#FF0000",
             fillOpacity: 0.0,
-            label: labelField,
+            label: "${getLabel}",
             fontColor: "#8B0000",
             fontSize: "14px",
             fontFamily: "Sarabun, sans-serif",
@@ -337,25 +392,31 @@ tabPane.innerHTML = `
             labelOutlineWidth: 3,
             fontWeight: "bold",
             labelAlign: "cm"
+        }, {
+            context: {
+                getLabel: function(feature) {
+                    if (!W?.map || W.map.getZoom() < LABEL_MIN_ZOOM) return "";
+                    return resolveLabel(feature);
+                }
+            }
         });
 
-        tambonLayer = new OpenLayers.Layer.Vector("Thailand Boundary Overlay", {
+        return new OpenLayers.Layer.Vector("Thailand Boundary Overlay", {
             styleMap: new OpenLayers.StyleMap(style),
             displayInLayerSwitcher: true
         });
+    }
 
-        tambonLayer.addFeatures(features);
-        W.map.addLayer(tambonLayer);
+    function bringLayerToFront(layer) {
+        const maxZ = W.map.layers.reduce((max, l) => {
+            const z = Number(l.getZIndex());
+            return Number.isFinite(z) ? Math.max(max, z) : max;
+        }, 0);
+        layer.setZIndex(maxZ + 1);
+    }
 
-        const maxZ = Math.max(...W.map.layers.map(l => l.getZIndex()));
-        tambonLayer.setZIndex(maxZ + 1);
-
-        if (tambonLayer.div) {
-            tambonLayer.div.style.pointerEvents = "none";
-            tambonLayer.div.style.background = "transparent";
-        }
-
-        statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${features.length} พื้นที่)`;
+    function finalizeLayer(featureCount, statusDiv) {
+        statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่)`;
     }
 
 })();
