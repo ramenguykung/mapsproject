@@ -103,13 +103,14 @@
     };
 
     const FRAME_BUDGET_MS = 10;
-    const MAX_FEATURES_PER_BATCH = 50;
+    const MAX_FEATURES_PER_BATCH = 15;
     const LABEL_MIN_ZOOM = 12;
     const PROGRESS_UPDATE_INTERVAL_MS = 120;
     const LABEL_FEATURE_LIMIT = 1200;
 
     let tambonLayer = null;
     let activeLoadToken = 0;
+    let activeRequest = null;
     const geoJsonCache = new Map();
 
     if (W?.userscripts?.state?.isInitialized) {
@@ -148,6 +149,9 @@ tabPane.innerHTML = `
                     <button id="tb-load-btn" class="btn btn-primary" style="width: 100%; margin-bottom: 8px;">
                         โหลดข้อมูล
                     </button>
+                    <button id="tb-cancel-btn" class="btn btn-warning" style="width: 100%; margin-bottom: 8px; display: none;">
+                        ยกเลิกการโหลด
+                    </button>
                     <button id="tb-clear-btn" class="btn btn-default" style="width: 100%;">
                         ลบเส้นออก
                     </button>
@@ -176,6 +180,7 @@ tabPane.innerHTML = `
         const input = document.getElementById('tb-province-input'); // ใช้ input แทน select
         const datalist = document.getElementById('tb-provinces-list'); // ตัวเก็บรายชื่อ
         const btnLoad = document.getElementById('tb-load-btn');
+        const btnCancel = document.getElementById('tb-cancel-btn');
         const btnClear = document.getElementById('tb-clear-btn');
         const statusDiv = document.getElementById('tb-status');
 
@@ -183,6 +188,51 @@ tabPane.innerHTML = `
         const progressBar = document.getElementById('tb-progress-bar');
         const progressText = document.getElementById('tb-progress-text');
         const etaText = document.getElementById('tb-eta-text');
+        let isLoading = false;
+
+        const setLoadingState = (loading) => {
+            isLoading = loading;
+            input.disabled = loading;
+            btnLoad.disabled = loading;
+            btnClear.disabled = loading;
+            btnCancel.style.display = loading ? "block" : "none";
+            btnCancel.disabled = !loading;
+        };
+
+        const resetProgressUi = () => {
+            progressBar.style.width = "0%";
+            progressText.innerText = "0%";
+            etaText.innerText = "--:--";
+            progressContainer.style.display = "none";
+        };
+
+        const abortActiveRequest = () => {
+            if (activeRequest && typeof activeRequest.abort === "function") {
+                try {
+                    activeRequest.abort();
+                } catch (err) {
+                    console.warn("WME Tambon: request abort failed", err);
+                }
+            }
+            activeRequest = null;
+        };
+
+        const cancelLoading = () => {
+            activeLoadToken += 1;
+            abortActiveRequest();
+
+            if (tambonLayer) {
+                W.map.removeLayer(tambonLayer);
+                tambonLayer.destroy();
+                tambonLayer = null;
+            }
+
+            setLoadingState(false);
+            resetProgressUi();
+            statusDiv.innerText = "สถานะ: ยกเลิกการโหลดแล้ว";
+        };
+
+        setLoadingState(false);
 
         // เติมรายชื่อลง Datalist
         Object.keys(PROVINCES).sort((a,b) => parseInt(a) - parseInt(b)).forEach(key => {
@@ -203,20 +253,29 @@ tabPane.innerHTML = `
                 progressBar.style.width = "0%";
                 progressText.innerText = "0%";
                 etaText.innerText = "กำลังโหลด...";
+                setLoadingState(true);
 
                 loadBoundary(selectedKey, PROVINCES[selectedKey].file, statusDiv, {
                     bar: progressBar,
                     text: progressText,
                     eta: etaText
+                }, () => {
+                    setLoadingState(false);
                 });
             } else {
                 alert("กรุณาเลือกจังหวัดให้ถูกต้อง (ต้องตรงกับในรายการ)");
             }
         });
 
+        btnCancel.addEventListener('click', () => {
+            if (!isLoading) return;
+            cancelLoading();
+        });
+
         btnClear.addEventListener('click', () => {
             // ยกเลิกงานที่กำลังโหลด/ประมวลผลอยู่
             activeLoadToken += 1;
+            abortActiveRequest();
 
             if (tambonLayer) {
                 W.map.removeLayer(tambonLayer);
@@ -224,6 +283,7 @@ tabPane.innerHTML = `
                 tambonLayer = null;
             }
 
+            setLoadingState(false);
             statusDiv.innerText = "สถานะ: ลบเส้นแล้ว";
             progressContainer.style.display = "none";
         });
@@ -231,10 +291,13 @@ tabPane.innerHTML = `
 
     function fetchGM(url) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            const request = GM_xmlhttpRequest({
                 method: "GET",
                 url: url,
                 onload: function(response) {
+                    if (activeRequest === request) {
+                        activeRequest = null;
+                    }
                     if (response.status >= 200 && response.status < 300) {
                         try {
                             const json = JSON.parse(response.responseText);
@@ -247,9 +310,19 @@ tabPane.innerHTML = `
                     }
                 },
                 onerror: function(err) {
+                    if (activeRequest === request) {
+                        activeRequest = null;
+                    }
                     reject(new Error("Network Error"));
+                },
+                onabort: function() {
+                    if (activeRequest === request) {
+                        activeRequest = null;
+                    }
+                    reject(new Error("Request canceled"));
                 }
             });
+            activeRequest = request;
         });
     }
 
@@ -277,7 +350,7 @@ tabPane.innerHTML = `
         return adm3 || adm2;
     }
 
-    function loadBoundary(provinceKey, filename, statusDiv, ui) {
+    function loadBoundary(provinceKey, filename, statusDiv, ui, onComplete) {
         const loadToken = ++activeLoadToken;
         const url = DATA_BASE_URL + filename;
 
@@ -291,17 +364,20 @@ tabPane.innerHTML = `
             .then(data => {
                 if (loadToken !== activeLoadToken) return;
                 statusDiv.innerText = "กำลังประมวลผล...";
-                drawLayerWithProgress(data, provinceKey, statusDiv, ui, loadToken);
+                drawLayerWithProgress(data, provinceKey, statusDiv, ui, loadToken, onComplete);
             })
             .catch(err => {
                 if (loadToken !== activeLoadToken) return;
                 console.error("Load Error:", err);
                 statusDiv.innerText = "❌ ผิดพลาด: " + err.message;
+                if (typeof onComplete === "function") {
+                    onComplete();
+                }
             });
     }
 
     // Progress & ETA
-    function drawLayerWithProgress(geoJsonData, provinceKey, statusDiv, ui, loadToken) {
+    function drawLayerWithProgress(geoJsonData, provinceKey, statusDiv, ui, loadToken, onComplete) {
         const allFeatures = Array.isArray(geoJsonData?.features) ? geoJsonData.features : [];
         const total = allFeatures.length;
 
@@ -310,6 +386,9 @@ tabPane.innerHTML = `
             ui.bar.style.width = "0%";
             ui.text.innerText = "0%";
             ui.eta.innerText = "--:--";
+            if (typeof onComplete === "function") {
+                onComplete();
+            }
             return;
         }
 
@@ -397,6 +476,9 @@ tabPane.innerHTML = `
                     tambonLayer.redraw();
                 }
                 finalizeLayer(addedCount, statusDiv, labelsEnabled);
+                if (typeof onComplete === "function") {
+                    onComplete();
+                }
             }
         }
 
