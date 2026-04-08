@@ -107,10 +107,14 @@
     const LABEL_MIN_ZOOM = 12;
     const PROGRESS_UPDATE_INTERVAL_MS = 120;
     const LABEL_FEATURE_LIMIT = 1200;
+    const VIEWPORT_PADDING_RATIO = 0.15;
+    const VIEWPORT_REFRESH_DEBOUNCE_MS = 180;
 
     let tambonLayer = null;
     let activeLoadToken = 0;
     let activeRequest = null;
+    let viewportSession = null;
+    let viewportRefreshTimer = null;
     const geoJsonCache = new Map();
 
     if (W?.userscripts?.state?.isInitialized) {
@@ -220,6 +224,7 @@ tabPane.innerHTML = `
         const cancelLoading = () => {
             activeLoadToken += 1;
             abortActiveRequest();
+            teardownViewportSession();
 
             if (tambonLayer) {
                 W.map.removeLayer(tambonLayer);
@@ -276,6 +281,7 @@ tabPane.innerHTML = `
             // ยกเลิกงานที่กำลังโหลด/ประมวลผลอยู่
             activeLoadToken += 1;
             abortActiveRequest();
+            teardownViewportSession();
 
             if (tambonLayer) {
                 W.map.removeLayer(tambonLayer);
@@ -354,6 +360,8 @@ tabPane.innerHTML = `
         const loadToken = ++activeLoadToken;
         const url = DATA_BASE_URL + filename;
 
+        teardownViewportSession();
+
         if (tambonLayer) {
             W.map.removeLayer(tambonLayer);
             tambonLayer.destroy();
@@ -393,22 +401,13 @@ tabPane.innerHTML = `
         }
 
         const labelsEnabled = total <= LABEL_FEATURE_LIMIT;
-        tambonLayer = createBoundaryLayer(provinceKey, labelsEnabled);
-        W.map.addLayer(tambonLayer);
-        bringLayerToFront(tambonLayer);
-
-        if (tambonLayer.div) {
-            tambonLayer.div.style.pointerEvents = "none";
-            tambonLayer.div.style.background = "transparent";
-        }
-        tambonLayer.setVisibility(false);
-
+        const indexedItems = [];
+        const itemsById = new Map();
         let index = 0;
-        let addedCount = 0;
         const startTime = performance.now();
         let lastProgressUpdateAt = 0;
 
-        function updateProgress(force) {
+        function updateIndexProgress(force) {
             const now = performance.now();
             if (!force && (now - lastProgressUpdateAt) < PROGRESS_UPDATE_INTERVAL_MS) {
                 return;
@@ -417,72 +416,363 @@ tabPane.innerHTML = `
 
             const elapsed = Math.max((now - startTime) / 1000, 0.001);
             const pct = Math.floor((index / total) * 100);
-
             ui.bar.style.width = pct + "%";
-            ui.text.innerText = pct + "% (" + index + "/" + total + ")";
+            ui.text.innerText = "ดัชนี: " + pct + "% (" + index + "/" + total + ")";
 
             if (index > 0 && index < total) {
                 const rate = index / elapsed;
-                const remainingItems = total - index;
-                const etaSeconds = remainingItems / Math.max(rate, 0.001);
-
+                const etaSeconds = (total - index) / Math.max(rate, 0.001);
                 ui.eta.innerText = "เหลืออีก: " + formatTime(etaSeconds);
             } else if (index >= total) {
-                ui.eta.innerText = "เสร็จสิ้น";
+                ui.eta.innerText = "กำลังแสดงมุมมอง...";
             }
         }
 
-        function processBatch() {
+        function processIndexBatch() {
             if (loadToken !== activeLoadToken) return;
+
+            const frameStart = performance.now();
+            let processedInBatch = 0;
+
+            while (
+                index < total &&
+                processedInBatch < (MAX_FEATURES_PER_BATCH * 10) &&
+                (performance.now() - frameStart) < FRAME_BUDGET_MS
+            ) {
+                const featureIndex = index;
+                const f = allFeatures[index];
+                index += 1;
+                processedInBatch += 1;
+
+                if (!f || !f.geometry) continue;
+
+                const bounds = computeGeometryBounds(f.geometry);
+                if (!bounds) continue;
+
+                const attrs = f.properties || {};
+                if (labelsEnabled && !attrs.__tbLabel) {
+                    attrs.__tbLabel = resolveFeatureLabel(provinceKey, attrs);
+                }
+
+                const item = {
+                    id: featureIndex,
+                    geometry: f.geometry,
+                    attributes: attrs,
+                    bounds,
+                    olFeature: null
+                };
+                indexedItems.push(item);
+                itemsById.set(featureIndex, item);
+            }
+
+            updateIndexProgress(false);
+
+            if (index < total) {
+                scheduleNextFrame(processIndexBatch);
+                return;
+            }
+
+            updateIndexProgress(true);
+
+            tambonLayer = createBoundaryLayer(provinceKey, labelsEnabled);
+            W.map.addLayer(tambonLayer);
+            bringLayerToFront(tambonLayer);
+
+            if (tambonLayer.div) {
+                tambonLayer.div.style.pointerEvents = "none";
+                tambonLayer.div.style.background = "transparent";
+            }
+            tambonLayer.setVisibility(false);
+
+            const session = {
+                loadToken,
+                labelsEnabled,
+                items: indexedItems,
+                itemsById,
+                visibleIds: new Set(),
+                refreshId: 0,
+                moveHandler: null
+            };
+            viewportSession = session;
+            statusDiv.innerText = "กำลังโหลดเฉพาะมุมมองปัจจุบัน...";
+
+            refreshViewportFeatures(session, statusDiv, ui, {
+                isInitial: true,
+                onComplete: function() {
+                    attachViewportRefreshHandler(session, statusDiv, ui);
+                    if (typeof onComplete === "function") {
+                        onComplete();
+                    }
+                }
+            });
+        }
+
+        processIndexBatch();
+    }
+
+    function refreshViewportFeatures(session, statusDiv, ui, options) {
+        const isInitial = Boolean(options && options.isInitial);
+        const onComplete = options && options.onComplete;
+
+        if (!isViewportSessionActive(session)) {
+            return;
+        }
+
+        const extent = getCurrentPaddedExtent();
+        if (!extent) {
+            if (isInitial && typeof onComplete === "function") {
+                onComplete();
+            }
+            return;
+        }
+
+        const refreshId = ++session.refreshId;
+        const targetItems = [];
+        for (let i = 0; i < session.items.length; i += 1) {
+            const item = session.items[i];
+            if (boundsIntersect(item.bounds, extent)) {
+                targetItems.push(item);
+            }
+        }
+
+        const targetIdSet = new Set(targetItems.map(item => item.id));
+        const idsToRemove = [];
+        session.visibleIds.forEach(id => {
+            if (!targetIdSet.has(id)) {
+                idsToRemove.push(id);
+            }
+        });
+
+        if (idsToRemove.length && tambonLayer) {
+            const removeFeatures = [];
+            for (let i = 0; i < idsToRemove.length; i += 1) {
+                const item = session.itemsById.get(idsToRemove[i]);
+                if (item && item.olFeature) {
+                    removeFeatures.push(item.olFeature);
+                }
+            }
+            if (removeFeatures.length) {
+                tambonLayer.removeFeatures(removeFeatures, { silent: true });
+            }
+            for (let i = 0; i < idsToRemove.length; i += 1) {
+                session.visibleIds.delete(idsToRemove[i]);
+            }
+        }
+
+        const addQueue = [];
+        for (let i = 0; i < targetItems.length; i += 1) {
+            const item = targetItems[i];
+            if (!session.visibleIds.has(item.id)) {
+                addQueue.push(item);
+            }
+        }
+
+        let addIndex = 0;
+        const startTime = performance.now();
+        let lastProgressUpdateAt = 0;
+
+        function updateViewportProgress(force) {
+            if (!isInitial) return;
+
+            const now = performance.now();
+            if (!force && (now - lastProgressUpdateAt) < PROGRESS_UPDATE_INTERVAL_MS) {
+                return;
+            }
+            lastProgressUpdateAt = now;
+
+            const totalToAdd = addQueue.length;
+            const pct = totalToAdd === 0 ? 100 : Math.floor((addIndex / totalToAdd) * 100);
+            ui.bar.style.width = pct + "%";
+            ui.text.innerText = "มุมมอง: " + pct + "% (" + addIndex + "/" + totalToAdd + ")";
+
+            if (totalToAdd === 0 || addIndex >= totalToAdd) {
+                ui.eta.innerText = "เสร็จสิ้น";
+                return;
+            }
+
+            const elapsed = Math.max((now - startTime) / 1000, 0.001);
+            const rate = addIndex / elapsed;
+            const etaSeconds = (totalToAdd - addIndex) / Math.max(rate, 0.001);
+            ui.eta.innerText = "เหลืออีก: " + formatTime(etaSeconds);
+        }
+
+        function processAddBatch() {
+            if (!isViewportSessionActive(session, refreshId)) return;
 
             const frameStart = performance.now();
             const batchFeatures = [];
             let processedInBatch = 0;
 
             while (
-                index < total &&
+                addIndex < addQueue.length &&
                 processedInBatch < MAX_FEATURES_PER_BATCH &&
                 (performance.now() - frameStart) < FRAME_BUDGET_MS
             ) {
-                const f = allFeatures[index];
-                index += 1;
+                const item = addQueue[addIndex];
+                addIndex += 1;
                 processedInBatch += 1;
 
-                if (!f || !f.geometry) continue;
-                const olGeometry = W.userscripts.toOLGeometry(f.geometry);
-                if (olGeometry) {
-                    const attrs = f.properties || {};
-                    if (labelsEnabled && !attrs.__tbLabel) {
-                        attrs.__tbLabel = resolveFeatureLabel(provinceKey, attrs);
-                    }
-                    const feature = new OpenLayers.Feature.Vector(olGeometry, attrs);
-                    batchFeatures.push(feature);
+                if (!item.olFeature) {
+                    const olGeometry = W.userscripts.toOLGeometry(item.geometry);
+                    if (!olGeometry) continue;
+                    item.olFeature = new OpenLayers.Feature.Vector(olGeometry, item.attributes);
                 }
+
+                batchFeatures.push(item.olFeature);
+                session.visibleIds.add(item.id);
             }
 
             if (batchFeatures.length && tambonLayer) {
                 tambonLayer.addFeatures(batchFeatures, { silent: true });
-                addedCount += batchFeatures.length;
             }
 
-            updateProgress(false);
+            updateViewportProgress(false);
 
-            if (index < total) {
-                scheduleNextFrame(processBatch);
+            if (addIndex < addQueue.length) {
+                scheduleNextFrame(processAddBatch);
+                return;
+            }
+
+            updateViewportProgress(true);
+            if (tambonLayer) {
+                tambonLayer.setVisibility(true);
+                tambonLayer.redraw();
+            }
+
+            if (isInitial) {
+                finalizeLayer(session.visibleIds.size, statusDiv, session.labelsEnabled, true);
             } else {
-                updateProgress(true);
-                if (tambonLayer) {
-                    tambonLayer.setVisibility(true);
-                    tambonLayer.redraw();
-                }
-                finalizeLayer(addedCount, statusDiv, labelsEnabled);
-                if (typeof onComplete === "function") {
-                    onComplete();
-                }
+                statusDiv.innerText = `✅ อัปเดตมุมมองแล้ว (${session.visibleIds.size} พื้นที่ในหน้าจอ)`;
+            }
+
+            if (typeof onComplete === "function") {
+                onComplete();
             }
         }
 
-        processBatch();
+        processAddBatch();
+    }
+
+    function isViewportSessionActive(session, refreshId) {
+        if (!session || viewportSession !== session) return false;
+        if (session.loadToken !== activeLoadToken) return false;
+        if (typeof refreshId === "number" && session.refreshId !== refreshId) return false;
+        return true;
+    }
+
+    function attachViewportRefreshHandler(session, statusDiv, ui) {
+        if (!isViewportSessionActive(session)) return;
+        if (!W?.map?.events?.register) return;
+        if (session.moveHandler) return;
+
+        session.moveHandler = function() {
+            if (!isViewportSessionActive(session)) return;
+
+            if (viewportRefreshTimer) {
+                clearTimeout(viewportRefreshTimer);
+            }
+
+            viewportRefreshTimer = setTimeout(() => {
+                viewportRefreshTimer = null;
+                refreshViewportFeatures(session, statusDiv, ui, { isInitial: false });
+            }, VIEWPORT_REFRESH_DEBOUNCE_MS);
+        };
+
+        W.map.events.register("moveend", null, session.moveHandler);
+    }
+
+    function teardownViewportSession() {
+        if (viewportRefreshTimer) {
+            clearTimeout(viewportRefreshTimer);
+            viewportRefreshTimer = null;
+        }
+
+        if (viewportSession && viewportSession.moveHandler && W?.map?.events?.unregister) {
+            W.map.events.unregister("moveend", null, viewportSession.moveHandler);
+        }
+
+        viewportSession = null;
+    }
+
+    function getCurrentPaddedExtent() {
+        const mapExtent = W?.map?.getExtent ? W.map.getExtent() : null;
+        if (!mapExtent) return null;
+
+        const width = Math.max(mapExtent.right - mapExtent.left, 0);
+        const height = Math.max(mapExtent.top - mapExtent.bottom, 0);
+        const padX = width * VIEWPORT_PADDING_RATIO;
+        const padY = height * VIEWPORT_PADDING_RATIO;
+
+        return {
+            left: mapExtent.left - padX,
+            right: mapExtent.right + padX,
+            bottom: mapExtent.bottom - padY,
+            top: mapExtent.top + padY
+        };
+    }
+
+    function boundsIntersect(bounds, extent) {
+        if (!bounds || !extent) return false;
+        return !(
+            bounds.maxX < extent.left ||
+            bounds.minX > extent.right ||
+            bounds.maxY < extent.bottom ||
+            bounds.minY > extent.top
+        );
+    }
+
+    function computeGeometryBounds(geometry) {
+        if (!geometry) return null;
+
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+
+        function updateCoord(coord) {
+            if (!Array.isArray(coord) || coord.length < 2) return;
+            const x = Number(coord[0]);
+            const y = Number(coord[1]);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
+        }
+
+        function walkCoordinates(coords) {
+            if (!Array.isArray(coords) || coords.length === 0) return;
+
+            if (typeof coords[0] === "number") {
+                updateCoord(coords);
+                return;
+            }
+
+            for (let i = 0; i < coords.length; i += 1) {
+                walkCoordinates(coords[i]);
+            }
+        }
+
+        function walkGeometry(g) {
+            if (!g) return;
+            if (g.type === "GeometryCollection" && Array.isArray(g.geometries)) {
+                for (let i = 0; i < g.geometries.length; i += 1) {
+                    walkGeometry(g.geometries[i]);
+                }
+                return;
+            }
+
+            walkCoordinates(g.coordinates);
+        }
+
+        walkGeometry(geometry);
+
+        if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+            return null;
+        }
+
+        return { minX, minY, maxX, maxY };
     }
 
     function scheduleNextFrame(cb) {
@@ -542,11 +832,13 @@ tabPane.innerHTML = `
         layer.setZIndex(maxZ + 1);
     }
 
-    function finalizeLayer(featureCount, statusDiv, labelsEnabled) {
+    function finalizeLayer(featureCount, statusDiv, labelsEnabled, viewportMode) {
+        const modeSuffix = viewportMode ? " ในมุมมอง" : "";
+
         if (labelsEnabled) {
-            statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่)`;
+            statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่${modeSuffix})`;
         } else {
-            statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่, โหมดเร็ว: ปิดชื่อพื้นที่)`;
+            statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่${modeSuffix}, โหมดเร็ว: ปิดชื่อพื้นที่)`;
         }
     }
 
