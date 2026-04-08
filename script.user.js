@@ -102,11 +102,15 @@
         "80": { name: "นราธิวาส", file: "96-NTW.geojson" }
     };
 
-    const FRAME_BUDGET_MS = 12;
-    const LABEL_MIN_ZOOM = 15;
+    const FRAME_BUDGET_MS = 10;
+    const MAX_FEATURES_PER_BATCH = 50;
+    const LABEL_MIN_ZOOM = 12;
+    const PROGRESS_UPDATE_INTERVAL_MS = 120;
+    const LABEL_FEATURE_LIMIT = 1200;
 
     let tambonLayer = null;
     let activeLoadToken = 0;
+    const geoJsonCache = new Map();
 
     if (W?.userscripts?.state?.isInitialized) {
         init();
@@ -249,6 +253,30 @@ tabPane.innerHTML = `
         });
     }
 
+    function fetchGeoJson(url) {
+        if (!geoJsonCache.has(url)) {
+            const pending = fetchGM(url).catch(err => {
+                geoJsonCache.delete(url);
+                throw err;
+            });
+            geoJsonCache.set(url, pending);
+        }
+        return geoJsonCache.get(url);
+    }
+
+    function resolveFeatureLabel(provinceKey, attributes) {
+        const attrs = attributes || {};
+
+        if (provinceKey === "0") {
+            return attrs.ADM2_TH || "";
+        }
+
+        const adm3 = attrs.ADM3_TH || "";
+        const adm2 = attrs.ADM2_TH || "";
+        if (adm3 && adm2) return adm3 + ", " + adm2;
+        return adm3 || adm2;
+    }
+
     function loadBoundary(provinceKey, filename, statusDiv, ui) {
         const loadToken = ++activeLoadToken;
         const url = DATA_BASE_URL + filename;
@@ -259,7 +287,7 @@ tabPane.innerHTML = `
             tambonLayer = null;
         }
 
-        fetchGM(url)
+        fetchGeoJson(url)
             .then(data => {
                 if (loadToken !== activeLoadToken) return;
                 statusDiv.innerText = "กำลังประมวลผล...";
@@ -285,7 +313,8 @@ tabPane.innerHTML = `
             return;
         }
 
-        tambonLayer = createBoundaryLayer(provinceKey);
+        const labelsEnabled = total <= LABEL_FEATURE_LIMIT;
+        tambonLayer = createBoundaryLayer(provinceKey, labelsEnabled);
         W.map.addLayer(tambonLayer);
         bringLayerToFront(tambonLayer);
 
@@ -293,35 +322,20 @@ tabPane.innerHTML = `
             tambonLayer.div.style.pointerEvents = "none";
             tambonLayer.div.style.background = "transparent";
         }
+        tambonLayer.setVisibility(false);
 
         let index = 0;
         let addedCount = 0;
         const startTime = performance.now();
+        let lastProgressUpdateAt = 0;
 
-        function processBatch() {
-            if (loadToken !== activeLoadToken) return;
-
-            const frameStart = performance.now();
-            const batchFeatures = [];
-
-            while (index < total && (performance.now() - frameStart) < FRAME_BUDGET_MS) {
-                const f = allFeatures[index];
-                index += 1;
-
-                if (!f || !f.geometry) continue;
-                const olGeometry = W.userscripts.toOLGeometry(f.geometry);
-                if (olGeometry) {
-                    const feature = new OpenLayers.Feature.Vector(olGeometry, f.properties || {});
-                    batchFeatures.push(feature);
-                }
-            }
-
-            if (batchFeatures.length && tambonLayer) {
-                tambonLayer.addFeatures(batchFeatures);
-                addedCount += batchFeatures.length;
-            }
-
+        function updateProgress(force) {
             const now = performance.now();
+            if (!force && (now - lastProgressUpdateAt) < PROGRESS_UPDATE_INTERVAL_MS) {
+                return;
+            }
+            lastProgressUpdateAt = now;
+
             const elapsed = Math.max((now - startTime) / 1000, 0.001);
             const pct = Math.floor((index / total) * 100);
 
@@ -337,11 +351,52 @@ tabPane.innerHTML = `
             } else if (index >= total) {
                 ui.eta.innerText = "เสร็จสิ้น";
             }
+        }
+
+        function processBatch() {
+            if (loadToken !== activeLoadToken) return;
+
+            const frameStart = performance.now();
+            const batchFeatures = [];
+            let processedInBatch = 0;
+
+            while (
+                index < total &&
+                processedInBatch < MAX_FEATURES_PER_BATCH &&
+                (performance.now() - frameStart) < FRAME_BUDGET_MS
+            ) {
+                const f = allFeatures[index];
+                index += 1;
+                processedInBatch += 1;
+
+                if (!f || !f.geometry) continue;
+                const olGeometry = W.userscripts.toOLGeometry(f.geometry);
+                if (olGeometry) {
+                    const attrs = f.properties || {};
+                    if (labelsEnabled && !attrs.__tbLabel) {
+                        attrs.__tbLabel = resolveFeatureLabel(provinceKey, attrs);
+                    }
+                    const feature = new OpenLayers.Feature.Vector(olGeometry, attrs);
+                    batchFeatures.push(feature);
+                }
+            }
+
+            if (batchFeatures.length && tambonLayer) {
+                tambonLayer.addFeatures(batchFeatures, { silent: true });
+                addedCount += batchFeatures.length;
+            }
+
+            updateProgress(false);
 
             if (index < total) {
                 scheduleNextFrame(processBatch);
             } else {
-                finalizeLayer(addedCount, statusDiv);
+                updateProgress(true);
+                if (tambonLayer) {
+                    tambonLayer.setVisibility(true);
+                    tambonLayer.redraw();
+                }
+                finalizeLayer(addedCount, statusDiv, labelsEnabled);
             }
         }
 
@@ -364,19 +419,7 @@ tabPane.innerHTML = `
         return mins + " นาที " + secs + " วิ";
     }
 
-    function createBoundaryLayer(provinceKey) {
-        const resolveLabel = (feature) => {
-            const attrs = feature?.attributes || {};
-
-            if (provinceKey === "0") {
-                return attrs.ADM2_TH || "";
-            }
-
-            const adm3 = attrs.ADM3_TH || "";
-            const adm2 = attrs.ADM2_TH || "";
-            if (adm3 && adm2) return adm3 + ", " + adm2;
-            return adm3 || adm2;
-        };
+    function createBoundaryLayer(provinceKey, labelsEnabled) {
 
         const style = new OpenLayers.Style({
             strokeColor: "#FF0000",
@@ -395,8 +438,10 @@ tabPane.innerHTML = `
         }, {
             context: {
                 getLabel: function(feature) {
+                    if (!labelsEnabled) return "";
                     if (!W?.map || W.map.getZoom() < LABEL_MIN_ZOOM) return "";
-                    return resolveLabel(feature);
+                    const attrs = feature?.attributes || {};
+                    return attrs.__tbLabel || resolveFeatureLabel(provinceKey, attrs);
                 }
             }
         });
@@ -415,8 +460,12 @@ tabPane.innerHTML = `
         layer.setZIndex(maxZ + 1);
     }
 
-    function finalizeLayer(featureCount, statusDiv) {
-        statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่)`;
+    function finalizeLayer(featureCount, statusDiv, labelsEnabled) {
+        if (labelsEnabled) {
+            statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่)`;
+        } else {
+            statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่, โหมดเร็ว: ปิดชื่อพื้นที่)`;
+        }
     }
 
 })();
