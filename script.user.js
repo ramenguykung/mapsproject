@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Thailand Tambon
 // @namespace    https://github.com/wazeth/
-// @version      1.0.1
+// @version      2.0
 // @description  แสดงขอบเขตตำบล
 // @author       Waze Thailand
 // @match        https://*.waze.com/*/editor*
@@ -133,13 +133,13 @@
 tabPane.innerHTML = `
             <div style="padding: 5px 10px; box-sizing: border-box;">
                 <h3 style="margin-bottom: 15px; text-align: center;">${SCRIPT_TITLE}</h3>
-                
+
                 <div style="margin-bottom: 10px; font-size: 12px; color: #666;">
                     <strong>คำแนะนำ:</strong>
                     <ul style="padding-left: 20px; margin-top: 5px;">
                        <li>กรุงเทพฯ: แสดงเขต</li>
-                       <li>ต่างจังหวัด: แสดงตำบล/อำเภอ</li>
-                       <li>ความเร็วขึ้นอยู่กับขนาดพื้นที่และเน็ต</li>
+                       <li>ต่างจังหวัด: แสดงตำบล, อำเภอ</li>
+                       <li>ความเร็วขึ้นอยู่กับขนาดพื้นที่และอินเตอร์เน็ต</li>
                     </ul>
                 </div>
 
@@ -173,6 +173,17 @@ tabPane.innerHTML = `
 
                 <hr style="margin: 15px 0;"/>
                 <div id="tb-status" style="font-size:11px; color:#666; text-align: center;">สถานะ: พร้อมใช้งาน</div>
+                <hr style="margin: 15px 0; border-color: #ccc;"/>
+                <div id="tb-navigator-container" style="display: none; padding-bottom: 10px;">
+                    <div style="font-weight: bold; margin-bottom: 8px; font-size: 12px; color: #333;">วาร์ปปป</div>
+                    <div class="form-group" style="margin-bottom: 10px;">
+                        <select id="tb-district-select" class="form-control" style="width: 100%; height: 30px; font-size: 12px;">
+                            <option value="">-- เลือกอำเภอ/เขต --</option>
+                        </select>
+                    </div>
+                    <div id="tb-tambon-list" style="max-height: 250px; overflow-y: auto; padding-right: 5px;">
+                        </div>
+                </div>
             </div>
         `;
 
@@ -266,6 +277,9 @@ tabPane.innerHTML = `
                     eta: etaText
                 }, () => {
                     setLoadingState(false);
+                    if (navigatorContainer && Object.keys(currentProvinceData).length > 0) {
+                        navigatorContainer.style.display = "block";
+                    }
                 });
             } else {
                 alert("กรุณาเลือกจังหวัดให้ถูกต้อง (ต้องตรงกับในรายการ)");
@@ -292,7 +306,17 @@ tabPane.innerHTML = `
             setLoadingState(false);
             statusDiv.innerText = "สถานะ: ลบเส้นแล้ว";
             progressContainer.style.display = "none";
+            document.getElementById('tb-navigator-container').style.display = "none";
         });
+
+        //new
+        // เอาไว้ล่างสุดของฟังก์ชัน setupInteractions() ก็ได้ครับ
+        const districtSelect = document.getElementById('tb-district-select');
+        if (districtSelect) {
+            districtSelect.addEventListener('change', (e) => {
+                renderTambonButtons(e.target.value);
+            });
+        }
     }
 
     function fetchGM(url) {
@@ -371,6 +395,7 @@ tabPane.innerHTML = `
         fetchGeoJson(url)
             .then(data => {
                 if (loadToken !== activeLoadToken) return;
+                parseDistrictsForNavigator(data, provinceKey);
                 statusDiv.innerText = "กำลังประมวลผล...";
                 drawLayerWithProgress(data, provinceKey, statusDiv, ui, loadToken, onComplete);
             })
@@ -417,7 +442,7 @@ tabPane.innerHTML = `
             const elapsed = Math.max((now - startTime) / 1000, 0.001);
             const pct = Math.floor((index / total) * 100);
             ui.bar.style.width = pct + "%";
-            ui.text.innerText = "ดัชนี: " + pct + "% (" + index + "/" + total + ")";
+            ui.text.innerText = "กำลังโหลดข้อมูล: " + pct + "% (" + index + "/" + total + ")";
 
             if (index > 0 && index < total) {
                 const rate = index / elapsed;
@@ -583,7 +608,7 @@ tabPane.innerHTML = `
             const totalToAdd = addQueue.length;
             const pct = totalToAdd === 0 ? 100 : Math.floor((addIndex / totalToAdd) * 100);
             ui.bar.style.width = pct + "%";
-            ui.text.innerText = "มุมมอง: " + pct + "% (" + addIndex + "/" + totalToAdd + ")";
+            ui.text.innerText = "กำลังประมวลผล: " + pct + "% (" + addIndex + " จาก " + totalToAdd + ")";
 
             if (totalToAdd === 0 || addIndex >= totalToAdd) {
                 ui.eta.innerText = "เสร็จสิ้น";
@@ -698,16 +723,26 @@ tabPane.innerHTML = `
         const mapExtent = W?.map?.getExtent ? W.map.getExtent() : null;
         if (!mapExtent) return null;
 
-        const width = Math.max(mapExtent.right - mapExtent.left, 0);
-        const height = Math.max(mapExtent.top - mapExtent.bottom, 0);
+        // --- เพิ่มการแปลงระบบพิกัดตรงนี้ ---
+        // ดึงระบบพิกัดปัจจุบันของแผนที่ (ปกติคือ EPSG:900913)
+        const projMap = W.map.getProjectionObject() || new OpenLayers.Projection("EPSG:900913");
+        // ระบบพิกัดเป้าหมายที่ตรงกับ GeoJSON (Lat/Lon)
+        const projWGS84 = new OpenLayers.Projection("EPSG:4326");
+
+        // Clone ขอบเขตหน้าจอแล้วแปลงค่าเป็นพิกัด Lat/Lon
+        const extentWGS84 = mapExtent.clone().transform(projMap, projWGS84);
+
+        // นำขอบเขตที่แปลงแล้วมาคำนวณ
+        const width = Math.max(extentWGS84.right - extentWGS84.left, 0);
+        const height = Math.max(extentWGS84.top - extentWGS84.bottom, 0);
         const padX = width * VIEWPORT_PADDING_RATIO;
         const padY = height * VIEWPORT_PADDING_RATIO;
 
         return {
-            left: mapExtent.left - padX,
-            right: mapExtent.right + padX,
-            bottom: mapExtent.bottom - padY,
-            top: mapExtent.top + padY
+            left: extentWGS84.left - padX,
+            right: extentWGS84.right + padX,
+            bottom: extentWGS84.bottom - padY,
+            top: extentWGS84.top + padY
         };
     }
 
@@ -833,13 +868,114 @@ tabPane.innerHTML = `
     }
 
     function finalizeLayer(featureCount, statusDiv, labelsEnabled, viewportMode) {
-        const modeSuffix = viewportMode ? " ในมุมมอง" : "";
+        const modeSuffix = viewportMode ? "ในมุมมอง" : "";
 
         if (labelsEnabled) {
             statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่${modeSuffix})`;
         } else {
             statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่${modeSuffix}, โหมดเร็ว: ปิดชื่อพื้นที่)`;
         }
+    }
+
+    let currentProvinceData = {}; // เก็บรายชื่อ อำเภอ -> ตำบล
+
+    function parseDistrictsForNavigator(geoJsonData, provinceKey) {
+        currentProvinceData = {};
+        const allFeatures = Array.isArray(geoJsonData?.features) ? geoJsonData.features : [];
+
+        allFeatures.forEach(f => {
+            const attrs = f.properties || {};
+            const adm2 = attrs.ADM2_TH;
+            const adm3 = attrs.ADM3_TH;
+
+            if (!adm2) return;
+
+            const bounds = computeGeometryBounds(f.geometry);
+            let centerLon = null;
+            let centerLat = null;
+            if (bounds) {
+                centerLon = (bounds.minX + bounds.maxX) / 2;
+                centerLat = (bounds.minY + bounds.maxY) / 2;
+            }
+
+            if (!currentProvinceData[adm2]) {
+                currentProvinceData[adm2] = [];
+            }
+
+            const displayName = adm3 || adm2; // ถ้าไม่มีตำบล ให้ใช้ชื่ออำเภอแทน *กทม
+
+            const isDuplicate = currentProvinceData[adm2].find(t => t.name === displayName);
+            if (!isDuplicate) {
+                currentProvinceData[adm2].push({
+                    name: displayName,
+                    lon: centerLon,
+                    lat: centerLat
+                });
+            }
+        });
+
+        Object.keys(currentProvinceData).forEach(dist => {
+            currentProvinceData[dist].sort((a, b) => a.name.localeCompare(b.name, 'th'));
+        });
+
+        updateDistrictDropdown();
+    }
+
+    function updateDistrictDropdown() {
+        const districtSelect = document.getElementById('tb-district-select');
+        const navigatorContainer = document.getElementById('tb-navigator-container');
+        const tambonList = document.getElementById('tb-tambon-list');
+
+        districtSelect.innerHTML = '<option value="">-- เลือกอำเภอ / เขต --</option>';
+        tambonList.innerHTML = '';
+
+        const districts = Object.keys(currentProvinceData).sort((a, b) => a.localeCompare(b, 'th'));
+
+        if (districts.length > 0) {
+            districts.forEach(dist => {
+                const opt = document.createElement('option');
+                opt.value = dist;
+                opt.innerText = dist;
+                districtSelect.appendChild(opt);
+            });
+            navigatorContainer.style.display = "block";
+        } else {
+            navigatorContainer.style.display = "none";
+        }
+    }
+
+    function renderTambonButtons(selectedDistrict) {
+        const tambonList = document.getElementById('tb-tambon-list');
+        tambonList.innerHTML = '';
+
+        if (!selectedDistrict || !currentProvinceData[selectedDistrict]) return;
+
+        currentProvinceData[selectedDistrict].forEach(tambon => {
+            if (tambon.lon === null || tambon.lat === null) return;
+
+            const btn = document.createElement('button');
+            btn.className = "btn btn-default";
+            btn.style.cssText = "width: 100%; text-align: left; margin-bottom: 5px; font-size: 12px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; background: #fff;";
+            btn.innerHTML = `${tambon.name}`;
+
+            btn.addEventListener('click', () => {
+                goToLocation(tambon.lon, tambon.lat);
+            });
+
+            btn.onmouseover = () => btn.style.background = "#e6f7ff";
+            btn.onmouseout = () => btn.style.background = "#fff";
+
+            tambonList.appendChild(btn);
+        });
+    }
+
+    function goToLocation(lon, lat) {
+        if (!W?.map) return;
+        const projWGS84 = new OpenLayers.Projection("EPSG:4326");
+        const projMap = W.map.getProjectionObject() || new OpenLayers.Projection("EPSG:900913");
+
+        const center = new OpenLayers.LonLat(lon, lat).transform(projWGS84, projMap);
+        W.map.setCenter(center, 14); // Zoom level 14
     }
 
 })();
