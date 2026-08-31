@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         WME Thailand Tambon
 // @namespace    https://github.com/wazeth/
-// @version      2.0
+// @version      2.1
 // @description  แสดงขอบเขตตำบล
 // @author       Waze Thailand
 // @match        https://*.waze.com/*/editor*
 // @match        https://*.waze.com/editor*
 // @exclude      https://*.waze.com/user/editor*
+// @run-at       document-idle
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/561139/WME%20Thailand%20Tambon.user.js
 // @updateURL https://update.greasyfork.org/scripts/561139/WME%20Thailand%20Tambon.meta.js
@@ -16,13 +18,14 @@
 (function() {
     'use strict';
 
-    // --- CONFIGURATION ---
     const DATA_BASE_URL = "https://wazeth.github.io/mapsproject/geojson/";
     const SCRIPT_ID = "wme-th-tambon-tab-v2";
     const SCRIPT_TITLE = "ขอบเขตการปกครอง";
+    const LAYER_NAME = "wme-thailand-tambon-boundary";
+    const LAYER_CHECKBOX_NAME = "ขอบเขตการปกครอง";
+    const LAYER_Z_INDEX = 1000;
 
-    // รายชื่อจังหวัด
-    const PROVINCES = {
+    const PROVINCES = { // รายชื่อจังหวัด
         "0": { name: "กรุงเทพมหานคร", file: "10-bangkok.geojson" },
         "1": { name: "สมุทรปราการ", file: "11-SPK.geojson" },
         "2": { name: "นนทบุรี", file: "12-NTB.geojson" },
@@ -110,27 +113,37 @@
     const VIEWPORT_PADDING_RATIO = 0.15;
     const VIEWPORT_REFRESH_DEBOUNCE_MS = 180;
 
-    let tambonLayer = null;
+    let wmeSDK = null;
+    let isBoundaryLayerCreated = false;
+    let isBoundaryLayerEnabled = true;
     let activeLoadToken = 0;
     let activeRequest = null;
     let viewportSession = null;
     let viewportRefreshTimer = null;
     const geoJsonCache = new Map();
 
-    if (W?.userscripts?.state?.isInitialized) {
-        init();
-    } else {
-        document.addEventListener("wme-initialized", init, { once: true });
-    }
+    const pageWindow = typeof unsafeWindow === "undefined" ? window : unsafeWindow;
+    pageWindow.SDK_INITIALIZED.then(init);
 
+    /**
+     * Initializes the WME SDK integration and builds the script user interface.
+     *
+     * @returns {Promise<void>}
+     */
     async function init() {
         console.log("WME Tambon: Starting...");
-        const { tabLabel, tabPane } = W.userscripts.registerSidebarTab(SCRIPT_ID);
+        wmeSDK = pageWindow.getWmeSdk({
+            scriptId: SCRIPT_ID,
+            scriptName: SCRIPT_TITLE
+        });
 
-        tabLabel.innerHTML = '<span>🇹🇭</span>';
+        registerLayerCheckbox();
+        const { tabLabel, tabPane } = await wmeSDK.Sidebar.registerScriptTab();
+
+        tabLabel.innerHTML = '<span>TH</span>';
         tabLabel.title = SCRIPT_TITLE;
 
-tabPane.innerHTML = `
+        tabPane.innerHTML = `
             <div style="padding: 5px 10px; box-sizing: border-box;">
                 <h3 style="margin-bottom: 15px; text-align: center;">${SCRIPT_TITLE}</h3>
 
@@ -187,17 +200,48 @@ tabPane.innerHTML = `
             </div>
         `;
 
-        await W.userscripts.waitForElementConnected(tabPane);
         setupInteractions();
     }
 
+    /**
+     * Adds the script layer checkbox and applies checkbox changes to the SDK layer.
+     *
+     * @returns {void}
+     */
+    function registerLayerCheckbox() {
+        wmeSDK.LayerSwitcher.addLayerCheckbox({
+            name: LAYER_CHECKBOX_NAME,
+            isChecked: isBoundaryLayerEnabled
+        });
+
+        wmeSDK.Events.on({
+            eventName: "wme-layer-checkbox-toggled",
+            eventHandler: ({ name, checked }) => {
+                if (name !== LAYER_CHECKBOX_NAME) return;
+                isBoundaryLayerEnabled = checked;
+                if (isBoundaryLayerCreated) {
+                    wmeSDK.Map.setLayerVisibility({
+                        layerName: LAYER_NAME,
+                        visibility: checked
+                    });
+                }
+            }
+        });
+    }
+
+    /**
+     * Connects controls in the script tab to loading, clearing, and navigation actions.
+     *
+     * @returns {void}
+     */
     function setupInteractions() {
-        const input = document.getElementById('tb-province-input'); // ใช้ input แทน select
-        const datalist = document.getElementById('tb-provinces-list'); // ตัวเก็บรายชื่อ
+        const input = document.getElementById('tb-province-input');
+        const datalist = document.getElementById('tb-provinces-list');
         const btnLoad = document.getElementById('tb-load-btn');
         const btnCancel = document.getElementById('tb-cancel-btn');
         const btnClear = document.getElementById('tb-clear-btn');
         const statusDiv = document.getElementById('tb-status');
+        const navigatorContainer = document.getElementById('tb-navigator-container');
 
         const progressContainer = document.getElementById('tb-progress-container');
         const progressBar = document.getElementById('tb-progress-bar');
@@ -237,11 +281,7 @@ tabPane.innerHTML = `
             abortActiveRequest();
             teardownViewportSession();
 
-            if (tambonLayer) {
-                W.map.removeLayer(tambonLayer);
-                tambonLayer.destroy();
-                tambonLayer = null;
-            }
+            removeBoundaryLayer();
 
             setLoadingState(false);
             resetProgressUi();
@@ -250,21 +290,18 @@ tabPane.innerHTML = `
 
         setLoadingState(false);
 
-        // เติมรายชื่อลง Datalist
         Object.keys(PROVINCES).sort((a,b) => parseInt(a) - parseInt(b)).forEach(key => {
-            let opt = document.createElement('option');
-            opt.value = PROVINCES[key].name; // แสดงชื่อจังหวัดใน list
+            const opt = document.createElement('option');
+            opt.value = PROVINCES[key].name;
             datalist.appendChild(opt);
         });
 
         btnLoad.addEventListener('click', () => {
             const selectedName = input.value;
-            // หา key จากชื่อที่ user เลือก (Reverse Lookup)
             const selectedKey = Object.keys(PROVINCES).find(key => PROVINCES[key].name === selectedName);
 
             if(selectedKey && PROVINCES[selectedKey]) {
-                // Reset UI
-                statusDiv.innerText = "⏳ กำลังดาวน์โหลด...";
+                statusDiv.innerText = "กำลังดาวน์โหลด...";
                 progressContainer.style.display = "block";
                 progressBar.style.width = "0%";
                 progressText.innerText = "0%";
@@ -292,16 +329,10 @@ tabPane.innerHTML = `
         });
 
         btnClear.addEventListener('click', () => {
-            // ยกเลิกงานที่กำลังโหลด/ประมวลผลอยู่
             activeLoadToken += 1;
             abortActiveRequest();
             teardownViewportSession();
-
-            if (tambonLayer) {
-                W.map.removeLayer(tambonLayer);
-                tambonLayer.destroy();
-                tambonLayer = null;
-            }
+            removeBoundaryLayer();
 
             setLoadingState(false);
             statusDiv.innerText = "สถานะ: ลบเส้นแล้ว";
@@ -309,8 +340,6 @@ tabPane.innerHTML = `
             document.getElementById('tb-navigator-container').style.display = "none";
         });
 
-        //new
-        // เอาไว้ล่างสุดของฟังก์ชัน setupInteractions() ก็ได้ครับ
         const districtSelect = document.getElementById('tb-district-select');
         if (districtSelect) {
             districtSelect.addEventListener('change', (e) => {
@@ -319,6 +348,12 @@ tabPane.innerHTML = `
         }
     }
 
+    /**
+     * Downloads and parses a JSON resource through the userscript request API.
+     *
+     * @param {string} url Resource URL.
+     * @returns {Promise<object>} Parsed JSON data.
+     */
     function fetchGM(url) {
         return new Promise((resolve, reject) => {
             const request = GM_xmlhttpRequest({
@@ -356,6 +391,12 @@ tabPane.innerHTML = `
         });
     }
 
+    /**
+     * Returns a cached GeoJSON request for a resource URL.
+     *
+     * @param {string} url Resource URL.
+     * @returns {Promise<object>} Parsed GeoJSON data.
+     */
     function fetchGeoJson(url) {
         if (!geoJsonCache.has(url)) {
             const pending = fetchGM(url).catch(err => {
@@ -367,6 +408,13 @@ tabPane.innerHTML = `
         return geoJsonCache.get(url);
     }
 
+    /**
+     * Resolves the label shown for one administrative feature.
+     *
+     * @param {string} provinceKey Province key.
+     * @param {object} attributes GeoJSON properties.
+     * @returns {string} Display label.
+     */
     function resolveFeatureLabel(provinceKey, attributes) {
         const attrs = attributes || {};
 
@@ -380,42 +428,58 @@ tabPane.innerHTML = `
         return adm3 || adm2;
     }
 
+    /**
+     * Loads one province and starts indexed viewport rendering.
+     *
+     * @param {string} provinceKey Province key.
+     * @param {string} filename GeoJSON filename.
+     * @param {HTMLElement} statusDiv Status element.
+     * @param {object} ui Progress elements.
+     * @param {Function} onComplete Completion callback.
+     * @returns {void}
+     */
     function loadBoundary(provinceKey, filename, statusDiv, ui, onComplete) {
         const loadToken = ++activeLoadToken;
         const url = DATA_BASE_URL + filename;
 
         teardownViewportSession();
 
-        if (tambonLayer) {
-            W.map.removeLayer(tambonLayer);
-            tambonLayer.destroy();
-            tambonLayer = null;
-        }
+        removeBoundaryLayer();
 
         fetchGeoJson(url)
             .then(data => {
                 if (loadToken !== activeLoadToken) return;
-                parseDistrictsForNavigator(data, provinceKey);
+                parseDistrictsForNavigator(data);
                 statusDiv.innerText = "กำลังประมวลผล...";
                 drawLayerWithProgress(data, provinceKey, statusDiv, ui, loadToken, onComplete);
             })
             .catch(err => {
                 if (loadToken !== activeLoadToken) return;
                 console.error("Load Error:", err);
-                statusDiv.innerText = "❌ ผิดพลาด: " + err.message;
+                statusDiv.innerText = "ผิดพลาด: " + err.message;
                 if (typeof onComplete === "function") {
                     onComplete();
                 }
             });
     }
 
-    // Progress & ETA
+    /**
+     * Indexes source features without blocking the editor and starts viewport rendering.
+     *
+     * @param {object} geoJsonData Province GeoJSON data.
+     * @param {string} provinceKey Province key.
+     * @param {HTMLElement} statusDiv Status element.
+     * @param {object} ui Progress elements.
+     * @param {number} loadToken Active load token.
+     * @param {Function} onComplete Completion callback.
+     * @returns {void}
+     */
     function drawLayerWithProgress(geoJsonData, provinceKey, statusDiv, ui, loadToken, onComplete) {
         const allFeatures = Array.isArray(geoJsonData?.features) ? geoJsonData.features : [];
         const total = allFeatures.length;
 
         if (total === 0) {
-            statusDiv.innerText = "❌ ไม่พบข้อมูลพื้นที่ในไฟล์";
+            statusDiv.innerText = "ไม่พบข้อมูลพื้นที่ในไฟล์";
             ui.bar.style.width = "0%";
             ui.text.innerText = "0%";
             ui.eta.innerText = "--:--";
@@ -482,9 +546,10 @@ tabPane.innerHTML = `
                 const item = {
                     id: featureIndex,
                     geometry: f.geometry,
-                    attributes: attrs,
+                    properties: attrs,
                     bounds,
-                    olFeature: null
+                    sdkFeatures: null,
+                    addedFeatureIds: []
                 };
                 indexedItems.push(item);
                 itemsById.set(featureIndex, item);
@@ -499,15 +564,7 @@ tabPane.innerHTML = `
 
             updateIndexProgress(true);
 
-            tambonLayer = createBoundaryLayer(provinceKey, labelsEnabled);
-            W.map.addLayer(tambonLayer);
-            bringLayerToFront(tambonLayer);
-
-            if (tambonLayer.div) {
-                tambonLayer.div.style.pointerEvents = "none";
-                tambonLayer.div.style.background = "transparent";
-            }
-            tambonLayer.setVisibility(false);
+            createBoundaryLayer(provinceKey, labelsEnabled);
 
             const session = {
                 loadToken,
@@ -516,7 +573,7 @@ tabPane.innerHTML = `
                 itemsById,
                 visibleIds: new Set(),
                 refreshId: 0,
-                moveHandler: null
+                removeMoveHandler: null
             };
             viewportSession = session;
             statusDiv.innerText = "กำลังโหลดเฉพาะมุมมองปัจจุบัน...";
@@ -535,6 +592,15 @@ tabPane.innerHTML = `
         processIndexBatch();
     }
 
+    /**
+     * Reconciles SDK layer features with the padded current map viewport.
+     *
+     * @param {object} session Active viewport session.
+     * @param {HTMLElement} statusDiv Status element.
+     * @param {object} ui Progress elements.
+     * @param {object} options Refresh options.
+     * @returns {void}
+     */
     function refreshViewportFeatures(session, statusDiv, ui, options) {
         const isInitial = Boolean(options && options.isInitial);
         const onComplete = options && options.onComplete;
@@ -568,17 +634,13 @@ tabPane.innerHTML = `
             }
         });
 
-        if (idsToRemove.length && tambonLayer) {
-            const removeFeatures = [];
+        if (idsToRemove.length && isBoundaryLayerCreated) {
+            const removeItems = [];
             for (let i = 0; i < idsToRemove.length; i += 1) {
                 const item = session.itemsById.get(idsToRemove[i]);
-                if (item && item.olFeature) {
-                    removeFeatures.push(item.olFeature);
-                }
+                if (item) removeItems.push(item);
             }
-            if (removeFeatures.length) {
-                tambonLayer.removeFeatures(removeFeatures, { silent: true });
-            }
+            removeItemsFromBoundaryLayer(removeItems);
             for (let i = 0; i < idsToRemove.length; i += 1) {
                 session.visibleIds.delete(idsToRemove[i]);
             }
@@ -625,7 +687,7 @@ tabPane.innerHTML = `
             if (!isViewportSessionActive(session, refreshId)) return;
 
             const frameStart = performance.now();
-            const batchFeatures = [];
+            const batchItems = [];
             let processedInBatch = 0;
 
             while (
@@ -637,18 +699,16 @@ tabPane.innerHTML = `
                 addIndex += 1;
                 processedInBatch += 1;
 
-                if (!item.olFeature) {
-                    const olGeometry = W.userscripts.toOLGeometry(item.geometry);
-                    if (!olGeometry) continue;
-                    item.olFeature = new OpenLayers.Feature.Vector(olGeometry, item.attributes);
+                if (!item.sdkFeatures) {
+                    item.sdkFeatures = createSdkFeatures(item);
                 }
 
-                batchFeatures.push(item.olFeature);
+                batchItems.push(item);
                 session.visibleIds.add(item.id);
             }
 
-            if (batchFeatures.length && tambonLayer) {
-                tambonLayer.addFeatures(batchFeatures, { silent: true });
+            if (batchItems.length && isBoundaryLayerCreated) {
+                addItemsToBoundaryLayer(batchItems);
             }
 
             updateViewportProgress(false);
@@ -659,15 +719,18 @@ tabPane.innerHTML = `
             }
 
             updateViewportProgress(true);
-            if (tambonLayer) {
-                tambonLayer.setVisibility(true);
-                tambonLayer.redraw();
+            if (isBoundaryLayerCreated) {
+                wmeSDK.Map.setLayerVisibility({
+                    layerName: LAYER_NAME,
+                    visibility: isBoundaryLayerEnabled
+                });
+                wmeSDK.Map.redrawLayer({ layerName: LAYER_NAME });
             }
 
             if (isInitial) {
                 finalizeLayer(session.visibleIds.size, statusDiv, session.labelsEnabled, true);
             } else {
-                statusDiv.innerText = `✅ อัปเดตมุมมองแล้ว (${session.visibleIds.size} พื้นที่ในหน้าจอ)`;
+                statusDiv.innerText = `อัปเดตมุมมองแล้ว (${session.visibleIds.size} พื้นที่ในหน้าจอ)`;
             }
 
             if (typeof onComplete === "function") {
@@ -678,6 +741,13 @@ tabPane.innerHTML = `
         processAddBatch();
     }
 
+    /**
+     * Checks whether asynchronous viewport work still belongs to the active load.
+     *
+     * @param {object} session Viewport session.
+     * @param {number} [refreshId] Expected refresh identifier.
+     * @returns {boolean} True when the session is active.
+     */
     function isViewportSessionActive(session, refreshId) {
         if (!session || viewportSession !== session) return false;
         if (session.loadToken !== activeLoadToken) return false;
@@ -685,12 +755,19 @@ tabPane.innerHTML = `
         return true;
     }
 
+    /**
+     * Registers an SDK map move end handler for viewport refreshes.
+     *
+     * @param {object} session Active viewport session.
+     * @param {HTMLElement} statusDiv Status element.
+     * @param {object} ui Progress elements.
+     * @returns {void}
+     */
     function attachViewportRefreshHandler(session, statusDiv, ui) {
         if (!isViewportSessionActive(session)) return;
-        if (!W?.map?.events?.register) return;
-        if (session.moveHandler) return;
+        if (session.removeMoveHandler) return;
 
-        session.moveHandler = function() {
+        const moveHandler = function() {
             if (!isViewportSessionActive(session)) return;
 
             if (viewportRefreshTimer) {
@@ -703,49 +780,63 @@ tabPane.innerHTML = `
             }, VIEWPORT_REFRESH_DEBOUNCE_MS);
         };
 
-        W.map.events.register("moveend", null, session.moveHandler);
+        session.removeMoveHandler = wmeSDK.Events.on({
+            eventName: "wme-map-move-end",
+            eventHandler: moveHandler
+        });
     }
 
+    /**
+     * Cancels timers and unregisters the active SDK map event handler.
+     *
+     * @returns {void}
+     */
     function teardownViewportSession() {
         if (viewportRefreshTimer) {
             clearTimeout(viewportRefreshTimer);
             viewportRefreshTimer = null;
         }
 
-        if (viewportSession && viewportSession.moveHandler && W?.map?.events?.unregister) {
-            W.map.events.unregister("moveend", null, viewportSession.moveHandler);
+        if (viewportSession && viewportSession.removeMoveHandler) {
+            viewportSession.removeMoveHandler();
+            viewportSession.removeMoveHandler = null;
         }
 
         viewportSession = null;
     }
 
+    /**
+     * Gets the SDK map extent in WGS84 with extra viewport padding.
+     *
+     * @returns {object|null} Padded extent or null when unavailable.
+     */
     function getCurrentPaddedExtent() {
-        const mapExtent = W?.map?.getExtent ? W.map.getExtent() : null;
-        if (!mapExtent) return null;
+        const mapExtent = wmeSDK.Map.getMapExtent();
+        if (!Array.isArray(mapExtent) || mapExtent.length < 4) return null;
 
-        // --- เพิ่มการแปลงระบบพิกัดตรงนี้ ---
-        // ดึงระบบพิกัดปัจจุบันของแผนที่ (ปกติคือ EPSG:900913)
-        const projMap = W.map.getProjectionObject() || new OpenLayers.Projection("EPSG:900913");
-        // ระบบพิกัดเป้าหมายที่ตรงกับ GeoJSON (Lat/Lon)
-        const projWGS84 = new OpenLayers.Projection("EPSG:4326");
+        const [left, bottom, right, top] = mapExtent;
+        if (![left, bottom, right, top].every(Number.isFinite)) return null;
 
-        // Clone ขอบเขตหน้าจอแล้วแปลงค่าเป็นพิกัด Lat/Lon
-        const extentWGS84 = mapExtent.clone().transform(projMap, projWGS84);
-
-        // นำขอบเขตที่แปลงแล้วมาคำนวณ
-        const width = Math.max(extentWGS84.right - extentWGS84.left, 0);
-        const height = Math.max(extentWGS84.top - extentWGS84.bottom, 0);
+        const width = Math.max(right - left, 0);
+        const height = Math.max(top - bottom, 0);
         const padX = width * VIEWPORT_PADDING_RATIO;
         const padY = height * VIEWPORT_PADDING_RATIO;
 
         return {
-            left: extentWGS84.left - padX,
-            right: extentWGS84.right + padX,
-            bottom: extentWGS84.bottom - padY,
-            top: extentWGS84.top + padY
+            left: left - padX,
+            right: right + padX,
+            bottom: bottom - padY,
+            top: top + padY
         };
     }
 
+    /**
+     * Tests whether geometry bounds intersect the current map extent.
+     *
+     * @param {object} bounds Geometry bounds.
+     * @param {object} extent Map extent.
+     * @returns {boolean} True when the bounds intersect.
+     */
     function boundsIntersect(bounds, extent) {
         if (!bounds || !extent) return false;
         return !(
@@ -756,6 +847,12 @@ tabPane.innerHTML = `
         );
     }
 
+    /**
+     * Computes WGS84 bounds for a GeoJSON geometry.
+     *
+     * @param {object} geometry GeoJSON geometry.
+     * @returns {object|null} Geometry bounds or null for invalid coordinates.
+     */
     function computeGeometryBounds(geometry) {
         if (!geometry) return null;
 
@@ -810,14 +907,138 @@ tabPane.innerHTML = `
         return { minX, minY, maxX, maxY };
     }
 
-    function scheduleNextFrame(cb) {
-        if (typeof requestAnimationFrame === "function") {
-            requestAnimationFrame(cb);
-        } else {
-            setTimeout(cb, 0);
+    /**
+     * Flattens complex GeoJSON into geometry types accepted by the WME SDK.
+     *
+     * @param {object} geometry GeoJSON geometry.
+     * @returns {object[]} Atomic Point, LineString, or Polygon geometries.
+     */
+    function getAtomicGeometries(geometry) {
+        if (!geometry || typeof geometry.type !== "string") return [];
+
+        if (["Point", "LineString", "Polygon"].includes(geometry.type)) {
+            return [geometry];
+        }
+
+        const multiGeometryTypes = {
+            MultiPoint: "Point",
+            MultiLineString: "LineString",
+            MultiPolygon: "Polygon"
+        };
+        const atomicType = multiGeometryTypes[geometry.type];
+        if (atomicType && Array.isArray(geometry.coordinates)) {
+            return geometry.coordinates.map(coordinates => ({
+                type: atomicType,
+                coordinates
+            }));
+        }
+
+        if (geometry.type === "GeometryCollection" && Array.isArray(geometry.geometries)) {
+            return geometry.geometries.flatMap(getAtomicGeometries);
+        }
+
+        return [];
+    }
+
+    /**
+     * Builds uniquely identified SDK features for one indexed source feature.
+     *
+     * @param {object} item Indexed source feature.
+     * @returns {object[]} SDK compatible GeoJSON features.
+     */
+    function createSdkFeatures(item) {
+        return getAtomicGeometries(item.geometry).map((geometry, partIndex) => ({
+            id: item.id + "-" + partIndex,
+            type: "Feature",
+            geometry,
+            properties: {
+                ...item.properties,
+                __tbPrimaryPart: partIndex === 0
+            }
+        }));
+    }
+
+    /**
+     * Adds a batch of indexed source items through the WME SDK.
+     *
+     * @param {object[]} items Indexed source items.
+     * @returns {void}
+     */
+    function addItemsToBoundaryLayer(items) {
+        const features = items.flatMap(item => item.sdkFeatures || []);
+        if (!features.length) return;
+
+        try {
+            wmeSDK.Map.addFeaturesToLayer({
+                layerName: LAYER_NAME,
+                features
+            });
+            items.forEach(item => {
+                item.addedFeatureIds = (item.sdkFeatures || []).map(feature => feature.id);
+            });
+        } catch (error) {
+            console.warn("WME Tambon: SDK batch add failed, retrying each area", error);
+            items.forEach(item => {
+                const itemFeatures = item.sdkFeatures || [];
+                item.addedFeatureIds = [];
+                if (!itemFeatures.length) return;
+
+                try {
+                    wmeSDK.Map.addFeaturesToLayer({
+                        layerName: LAYER_NAME,
+                        features: itemFeatures
+                    });
+                    item.addedFeatureIds = itemFeatures.map(feature => feature.id);
+                } catch (itemError) {
+                    console.warn("WME Tambon: area could not be added: " + item.id, itemError);
+                }
+            });
         }
     }
 
+    /**
+     * Removes indexed source items from the SDK boundary layer.
+     *
+     * @param {object[]} items Indexed source items.
+     * @returns {void}
+     */
+    function removeItemsFromBoundaryLayer(items) {
+        const featureIds = items.flatMap(item => item.addedFeatureIds || []);
+        if (featureIds.length) {
+            try {
+                wmeSDK.Map.removeFeaturesFromLayer({
+                    layerName: LAYER_NAME,
+                    featureIds
+                });
+            } catch (error) {
+                console.warn("WME Tambon: SDK feature removal failed", error);
+            }
+        }
+        items.forEach(item => {
+            item.addedFeatureIds = [];
+        });
+    }
+
+    /**
+     * Schedules work for the next animation frame with a timer fallback.
+     *
+     * @param {Function} callback Work callback.
+     * @returns {void}
+     */
+    function scheduleNextFrame(callback) {
+        if (typeof requestAnimationFrame === "function") {
+            requestAnimationFrame(callback);
+        } else {
+            setTimeout(callback, 0);
+        }
+    }
+
+    /**
+     * Formats seconds as a short Thai duration.
+     *
+     * @param {number} seconds Duration in seconds.
+     * @returns {string} Formatted duration.
+     */
     function formatTime(seconds) {
         if (seconds < 1) return "< 1 วิ";
         if (seconds < 60) return Math.round(seconds) + " วิ";
@@ -826,60 +1047,93 @@ tabPane.innerHTML = `
         return mins + " นาที " + secs + " วิ";
     }
 
+    /**
+     * Creates and styles the administrative boundary layer through the WME SDK.
+     *
+     * @param {string} provinceKey Province key.
+     * @param {boolean} labelsEnabled Whether labels are enabled for this province.
+     * @returns {void}
+     */
     function createBoundaryLayer(provinceKey, labelsEnabled) {
-
-        const style = new OpenLayers.Style({
-            strokeColor: "#FF0000",
-            strokeOpacity: 0.8,
-            strokeWidth: 2,
-            fillColor: "#FF0000",
-            fillOpacity: 0.0,
-            label: "${getLabel}",
-            fontColor: "#8B0000",
-            fontSize: "14px",
-            fontFamily: "Sarabun, sans-serif",
-            labelOutlineColor: "#ffffff",
-            labelOutlineWidth: 3,
-            fontWeight: "bold",
-            labelAlign: "cm"
-        }, {
-            context: {
-                getLabel: function(feature) {
-                    if (!labelsEnabled) return "";
-                    if (!W?.map || W.map.getZoom() < LABEL_MIN_ZOOM) return "";
-                    const attrs = feature?.attributes || {};
-                    return attrs.__tbLabel || resolveFeatureLabel(provinceKey, attrs);
+        wmeSDK.Map.addLayer({
+            layerName: LAYER_NAME,
+            styleContext: {
+                getLabel: ({ feature, zoomLevel }) => {
+                    if (!labelsEnabled || zoomLevel < LABEL_MIN_ZOOM) return "";
+                    const properties = feature?.properties || {};
+                    if (!properties.__tbPrimaryPart) return "";
+                    return properties.__tbLabel || resolveFeatureLabel(provinceKey, properties);
                 }
-            }
+            },
+            styleRules: [{
+                style: {
+                    strokeColor: "#FF0000",
+                    strokeOpacity: 0.8,
+                    strokeWidth: 2,
+                    fillColor: "#FF0000",
+                    fillOpacity: 0,
+                    label: "${getLabel}",
+                    fontColor: "#8B0000",
+                    fontSize: "14px",
+                    fontFamily: "Sarabun, sans-serif",
+                    labelOutlineColor: "#ffffff",
+                    labelOutlineWidth: 3,
+                    fontWeight: "bold",
+                    labelAlign: "cm",
+                    pointerEvents: "none"
+                }
+            }]
         });
-
-        return new OpenLayers.Layer.Vector("Thailand Boundary Overlay", {
-            styleMap: new OpenLayers.StyleMap(style),
-            displayInLayerSwitcher: true
+        isBoundaryLayerCreated = true;
+        wmeSDK.Map.setLayerZIndex({
+            layerName: LAYER_NAME,
+            zIndex: LAYER_Z_INDEX
+        });
+        wmeSDK.Map.setLayerVisibility({
+            layerName: LAYER_NAME,
+            visibility: false
         });
     }
 
-    function bringLayerToFront(layer) {
-        const maxZ = W.map.layers.reduce((max, l) => {
-            const z = Number(l.getZIndex());
-            return Number.isFinite(z) ? Math.max(max, z) : max;
-        }, 0);
-        layer.setZIndex(maxZ + 1);
+    /**
+     * Removes the current boundary layer through the WME SDK.
+     *
+     * @returns {void}
+     */
+    function removeBoundaryLayer() {
+        if (!isBoundaryLayerCreated) return;
+        wmeSDK.Map.removeLayer({ layerName: LAYER_NAME });
+        isBoundaryLayerCreated = false;
     }
 
+    /**
+     * Writes the completed layer status.
+     *
+     * @param {number} featureCount Visible administrative area count.
+     * @param {HTMLElement} statusDiv Status element.
+     * @param {boolean} labelsEnabled Whether labels are enabled.
+     * @param {boolean} viewportMode Whether viewport mode is active.
+     * @returns {void}
+     */
     function finalizeLayer(featureCount, statusDiv, labelsEnabled, viewportMode) {
         const modeSuffix = viewportMode ? "ในมุมมอง" : "";
 
         if (labelsEnabled) {
-            statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่${modeSuffix})`;
+            statusDiv.innerText = `แสดงผลเรียบร้อย (${featureCount} พื้นที่${modeSuffix})`;
         } else {
-            statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${featureCount} พื้นที่${modeSuffix}, โหมดเร็ว: ปิดชื่อพื้นที่)`;
+            statusDiv.innerText = `แสดงผลเรียบร้อย (${featureCount} พื้นที่${modeSuffix}, โหมดเร็ว: ปิดชื่อพื้นที่)`;
         }
     }
 
-    let currentProvinceData = {}; // เก็บรายชื่อ อำเภอ -> ตำบล
+    let currentProvinceData = {};
 
-    function parseDistrictsForNavigator(geoJsonData, provinceKey) {
+    /**
+     * Builds the district and tambon navigator data from loaded GeoJSON.
+     *
+     * @param {object} geoJsonData Province GeoJSON data.
+     * @returns {void}
+     */
+    function parseDistrictsForNavigator(geoJsonData) {
         currentProvinceData = {};
         const allFeatures = Array.isArray(geoJsonData?.features) ? geoJsonData.features : [];
 
@@ -902,7 +1156,7 @@ tabPane.innerHTML = `
                 currentProvinceData[adm2] = [];
             }
 
-            const displayName = adm3 || adm2; // ถ้าไม่มีตำบล ให้ใช้ชื่ออำเภอแทน *กทม
+            const displayName = adm3 || adm2;
 
             const isDuplicate = currentProvinceData[adm2].find(t => t.name === displayName);
             if (!isDuplicate) {
@@ -921,6 +1175,11 @@ tabPane.innerHTML = `
         updateDistrictDropdown();
     }
 
+    /**
+     * Rebuilds the district selector from the active province data.
+     *
+     * @returns {void}
+     */
     function updateDistrictDropdown() {
         const districtSelect = document.getElementById('tb-district-select');
         const navigatorContainer = document.getElementById('tb-navigator-container');
@@ -944,6 +1203,12 @@ tabPane.innerHTML = `
         }
     }
 
+    /**
+     * Renders navigation buttons for the selected district.
+     *
+     * @param {string} selectedDistrict District name.
+     * @returns {void}
+     */
     function renderTambonButtons(selectedDistrict) {
         const tambonList = document.getElementById('tb-tambon-list');
         tambonList.innerHTML = '';
@@ -956,7 +1221,7 @@ tabPane.innerHTML = `
             const btn = document.createElement('button');
             btn.className = "btn btn-default";
             btn.style.cssText = "width: 100%; text-align: left; margin-bottom: 5px; font-size: 12px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; background: #fff;";
-            btn.innerHTML = `${tambon.name}`;
+            btn.innerText = tambon.name;
 
             btn.addEventListener('click', () => {
                 goToLocation(tambon.lon, tambon.lat);
@@ -969,13 +1234,19 @@ tabPane.innerHTML = `
         });
     }
 
+    /**
+     * Centers the WME map on a WGS84 coordinate through the SDK.
+     *
+     * @param {number} lon Longitude.
+     * @param {number} lat Latitude.
+     * @returns {void}
+     */
     function goToLocation(lon, lat) {
-        if (!W?.map) return;
-        const projWGS84 = new OpenLayers.Projection("EPSG:4326");
-        const projMap = W.map.getProjectionObject() || new OpenLayers.Projection("EPSG:900913");
-
-        const center = new OpenLayers.LonLat(lon, lat).transform(projWGS84, projMap);
-        W.map.setCenter(center, 14); // Zoom level 14
+        if (!Number.isFinite(lon) || !Number.isFinite(lat)) return;
+        wmeSDK.Map.setMapCenter({
+            lonLat: { lon, lat },
+            zoomLevel: 14
+        });
     }
 
 })();
