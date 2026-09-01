@@ -8,6 +8,8 @@
 // @match        https://*.waze.com/editor*
 // @exclude      https://*.waze.com/user/editor*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @license      MIT
 // ==/UserScript==
 
@@ -102,12 +104,20 @@
 
     const LABEL_MIN_ZOOM = 12;
     const LABEL_FEATURE_LIMIT = 1200;
+    const OUTLINE_COLOR_STORAGE_KEY = "wme-th-tambon:outline-color";
+    const OUTLINE_OPACITY_STORAGE_KEY = "wme-th-tambon:outline-opacity";
+    const DEFAULT_OUTLINE_COLOR = "#FF0000";
+    const DEFAULT_OUTLINE_OPACITY = 0.8;
 
     let tambonLayer = null;
     let activeLoadToken = 0;
     let activeRequest = null;
     const geoJsonCache = new Map();
     let currentProvinceData = {};
+    let outlineSettings = {
+        color: DEFAULT_OUTLINE_COLOR,
+        opacity: DEFAULT_OUTLINE_OPACITY
+    };
 
     if (W?.userscripts?.state?.isInitialized) {
         init();
@@ -117,6 +127,7 @@
 
     async function init() {
         console.log("WME Tambon: Starting...");
+        outlineSettings = loadOutlineSettings();
         const { tabLabel, tabPane } = W.userscripts.registerSidebarTab(SCRIPT_ID);
 
         tabLabel.innerHTML = '<span>🇹🇭</span>';
@@ -138,6 +149,16 @@
                     <label for="tb-province-input" style="font-weight: bold;">จังหวัด:</label>
                     <input list="tb-provinces-list" id="tb-province-input" class="form-control" placeholder="-- พิมพ์หรือคลิกเพื่อเลือก --" style="width: 100%; margin-bottom: 10px;">
                     <datalist id="tb-provinces-list"></datalist>
+                </div>
+
+                <div class="form-group" style="margin-bottom: 10px;">
+                    <label for="tb-outline-color" style="font-weight: bold;">สีเส้น:</label>
+                    <input id="tb-outline-color" type="color" value="${outlineSettings.color}" style="width: 100%; height: 30px;">
+                </div>
+
+                <div class="form-group" style="margin-bottom: 10px;">
+                    <label for="tb-outline-opacity" style="font-weight: bold;">ความทึบของเส้น:</label>
+                    <input id="tb-outline-opacity" type="range" min="0" max="1" step="0.05" value="${outlineSettings.opacity}" style="width: 100%;">
                 </div>
 
                 <div style="margin-top: 15px;">
@@ -163,6 +184,9 @@
                 <div id="tb-navigator-container" style="display: none; padding-bottom: 10px;">
                     <div style="font-weight: bold; margin-bottom: 8px; font-size: 12px; color: #333;">วาร์ปปป</div>
                     <div class="form-group" style="margin-bottom: 10px;">
+                        <input id="tb-feature-search" class="form-control" placeholder="ค้นหาอำเภอ/เขต/ตำบล" style="width: 100%; height: 30px; font-size: 12px;">
+                    </div>
+                    <div class="form-group" style="margin-bottom: 10px;">
                         <select id="tb-district-select" class="form-control" style="width: 100%; height: 30px; font-size: 12px;">
                             <option value="">-- เลือกอำเภอ/เขต --</option>
                         </select>
@@ -174,6 +198,48 @@
 
         await W.userscripts.waitForElementConnected(tabPane);
         setupInteractions();
+    }
+
+    function loadOutlineSettings() {
+        let color = DEFAULT_OUTLINE_COLOR;
+        let opacity = DEFAULT_OUTLINE_OPACITY;
+
+        try {
+            const storedColor = GM_getValue(OUTLINE_COLOR_STORAGE_KEY, DEFAULT_OUTLINE_COLOR);
+            const storedOpacity = GM_getValue(OUTLINE_OPACITY_STORAGE_KEY, DEFAULT_OUTLINE_OPACITY);
+            if (isValidOutlineColor(storedColor)) color = storedColor;
+            if (
+                typeof storedOpacity === "number" &&
+                Number.isFinite(storedOpacity) &&
+                storedOpacity >= 0 &&
+                storedOpacity <= 1
+            ) {
+                opacity = storedOpacity;
+            }
+        } catch (error) {
+            console.warn("WME Tambon: outline settings could not be loaded", error);
+        }
+
+        return { color, opacity };
+    }
+
+    function persistOutlineSettings() {
+        try {
+            GM_setValue(OUTLINE_COLOR_STORAGE_KEY, outlineSettings.color);
+            GM_setValue(OUTLINE_OPACITY_STORAGE_KEY, outlineSettings.opacity);
+        } catch (error) {
+            console.warn("WME Tambon: outline settings could not be saved", error);
+        }
+    }
+
+    function isValidOutlineColor(value) {
+        return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
+    }
+
+    function redrawBoundaryLayer() {
+        if (tambonLayer && typeof tambonLayer.redraw === "function") {
+            tambonLayer.redraw();
+        }
     }
 
     function setupInteractions() {
@@ -188,6 +254,10 @@
         const progressBar = document.getElementById('tb-progress-bar');
         const progressText = document.getElementById('tb-progress-text');
         const etaText = document.getElementById('tb-eta-text');
+        const outlineColor = document.getElementById('tb-outline-color');
+        const outlineOpacity = document.getElementById('tb-outline-opacity');
+        const featureSearch = document.getElementById('tb-feature-search');
+        const districtSelect = document.getElementById('tb-district-select');
         let isLoading = false;
 
         const setLoadingState = (loading) => {
@@ -195,6 +265,7 @@
             input.disabled = loading;
             btnLoad.disabled = loading;
             btnClear.disabled = loading;
+            featureSearch.disabled = loading;
             btnCancel.style.display = loading ? "block" : "none";
             btnCancel.disabled = !loading;
         };
@@ -223,6 +294,9 @@
                 tambonLayer = null;
             }
 
+            currentProvinceData = {};
+            featureSearch.value = "";
+            document.getElementById('tb-navigator-container').style.display = "none";
             setLoadingState(false);
             resetProgressUi();
             statusDiv.innerText = "สถานะ: ยกเลิกการโหลดแล้ว";
@@ -241,6 +315,7 @@
             const selectedKey = Object.keys(PROVINCES).find(key => PROVINCES[key].name === selectedName);
 
             if(selectedKey && PROVINCES[selectedKey]) {
+                featureSearch.value = "";
                 statusDiv.innerText = "⏳ กำลังดาวน์โหลด...";
                 progressContainer.style.display = "block";
                 progressBar.style.width = "0%";
@@ -276,15 +351,40 @@
             setLoadingState(false);
             statusDiv.innerText = "สถานะ: ลบเส้นแล้ว";
             progressContainer.style.display = "none";
+            currentProvinceData = {};
             document.getElementById('tb-navigator-container').style.display = "none";
+            featureSearch.value = "";
         });
 
-        const districtSelect = document.getElementById('tb-district-select');
         if (districtSelect) {
             districtSelect.addEventListener('change', (e) => {
+                featureSearch.value = "";
                 renderTambonButtons(e.target.value);
             });
         }
+
+        featureSearch.addEventListener('input', () => {
+            if (normalizeSearchText(featureSearch.value)) {
+                renderSearchResults(featureSearch.value);
+            } else {
+                renderTambonButtons(districtSelect.value);
+            }
+        });
+
+        outlineColor.addEventListener('input', () => {
+            if (!isValidOutlineColor(outlineColor.value)) return;
+            outlineSettings.color = outlineColor.value;
+            redrawBoundaryLayer();
+        });
+        outlineColor.addEventListener('change', persistOutlineSettings);
+
+        outlineOpacity.addEventListener('input', () => {
+            const opacity = Number(outlineOpacity.value);
+            if (!Number.isFinite(opacity) || opacity < 0 || opacity > 1) return;
+            outlineSettings.opacity = opacity;
+            redrawBoundaryLayer();
+        });
+        outlineOpacity.addEventListener('change', persistOutlineSettings);
     }
 
     function fetchGM(url) {
@@ -487,13 +587,19 @@
 
     function createBoundaryLayer(provinceKey, labelsEnabled) {
         const style = new OpenLayers.Style({
-            strokeColor: "#FF0000", strokeOpacity: 0.8, strokeWidth: 2,
+            strokeColor: "${getStrokeColor}", strokeOpacity: "${getStrokeOpacity}", strokeWidth: 2,
             fillColor: "#FF0000", fillOpacity: 0.0,
             label: "${getLabel}",
             fontColor: "#8B0000", fontSize: "14px", fontFamily: "Sarabun, sans-serif",
             labelOutlineColor: "#ffffff", labelOutlineWidth: 3, fontWeight: "bold", labelAlign: "cm"
         }, {
             context: {
+                getStrokeColor: function() {
+                    return outlineSettings.color;
+                },
+                getStrokeOpacity: function() {
+                    return outlineSettings.opacity;
+                },
                 getLabel: function(feature) {
                     if (!labelsEnabled) return "";
                     if (!W?.map || W.map.getZoom() < LABEL_MIN_ZOOM) return "";
@@ -539,19 +645,20 @@
             const adm3 = attrs.ADM3_TH;
             if (!adm2) return;
 
-            const bounds = computeGeometryBounds(f.geometry);
-            let centerLon = null, centerLat = null;
-            if (bounds) {
-                centerLon = (bounds.minX + bounds.maxX) / 2;
-                centerLat = (bounds.minY + bounds.maxY) / 2;
-            }
-
             if (!currentProvinceData[adm2]) currentProvinceData[adm2] = [];
             const displayName = adm3 || adm2;
 
             const isDuplicate = currentProvinceData[adm2].find(t => t.name === displayName);
             if (!isDuplicate) {
-                currentProvinceData[adm2].push({ name: displayName, lon: centerLon, lat: centerLat });
+                const searchLabel = adm3 && adm2 ? adm3 + ", " + adm2 : displayName;
+                currentProvinceData[adm2].push({
+                    name: displayName,
+                    searchLabel,
+                    searchText: normalizeSearchText([adm2, adm3, searchLabel].filter(Boolean).join(" ")),
+                    geometry: f.geometry,
+                    center: null,
+                    centerResolved: false
+                });
             }
         });
 
@@ -559,6 +666,25 @@
             currentProvinceData[dist].sort((a, b) => a.name.localeCompare(b.name, 'th'));
         });
         updateDistrictDropdown();
+    }
+
+    function normalizeSearchText(value) {
+        return value.trim().replace(/\s+/g, " ").toLocaleLowerCase("th");
+    }
+
+    function renderSearchResults(rawQuery) {
+        const query = normalizeSearchText(rawQuery);
+        if (!query) {
+            const districtSelect = document.getElementById('tb-district-select');
+            renderTambonButtons(districtSelect ? districtSelect.value : "");
+            return;
+        }
+
+        const matches = Object.values(currentProvinceData)
+            .flat()
+            .filter(entry => entry.searchText.includes(query))
+            .sort((a, b) => a.searchLabel.localeCompare(b.searchLabel, 'th'));
+        renderNavigatorEntries(matches, entry => entry.searchLabel);
     }
 
     function updateDistrictDropdown() {
@@ -586,23 +712,42 @@
     }
 
     function renderTambonButtons(selectedDistrict) {
+        const entries = selectedDistrict && currentProvinceData[selectedDistrict]
+            ? currentProvinceData[selectedDistrict]
+            : [];
+        renderNavigatorEntries(entries, entry => entry.name);
+    }
+
+    function renderNavigatorEntries(entries, getLabel) {
         const tambonList = document.getElementById('tb-tambon-list');
         if (!tambonList) return;
         tambonList.innerHTML = '';
 
-        if (!selectedDistrict || !currentProvinceData[selectedDistrict]) return;
-
-        currentProvinceData[selectedDistrict].forEach(tambon => {
-            if (tambon.lon === null || tambon.lat === null) return;
+        entries.forEach(entry => {
             const btn = document.createElement('button');
             btn.className = "btn btn-default";
             btn.style.cssText = "width: 100%; text-align: left; margin-bottom: 5px; font-size: 12px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; background: #fff;";
-            btn.innerHTML = `${tambon.name}`;
-            btn.addEventListener('click', () => goToLocation(tambon.lon, tambon.lat));
+            btn.textContent = getLabel(entry);
+            btn.addEventListener('click', () => goToFeature(entry));
             btn.onmouseover = () => btn.style.background = "#e6f7ff";
             btn.onmouseout = () => btn.style.background = "#fff";
             tambonList.appendChild(btn);
         });
+    }
+
+    function goToFeature(entry) {
+        if (!entry.centerResolved) {
+            const bounds = computeGeometryBounds(entry.geometry);
+            entry.center = bounds
+                ? {
+                    lon: (bounds.minX + bounds.maxX) / 2,
+                    lat: (bounds.minY + bounds.maxY) / 2
+                }
+                : null;
+            entry.centerResolved = true;
+        }
+
+        if (entry.center) goToLocation(entry.center.lon, entry.center.lat);
     }
 
     function goToLocation(lon, lat) {
