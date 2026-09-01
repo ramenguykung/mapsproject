@@ -28,6 +28,9 @@ async function settleMicrotasks(turns = 6) {
  * @param {(args: object) => void} [options.onAddFeatures] Optional SDK add hook.
  * @param {(sdk: object) => void} [options.configureSdk] SDK customization before initialization.
  * @param {boolean} [options.deferSidebarRegistration=false] Keep sidebar registration pending.
+ * @param {number[]} [options.mapExtent] Initial WGS84 map extent.
+ * @param {number} [options.zoomLevel=14] Initial map zoom.
+ * @param {boolean} [options.confirmResult=true] Whole-province confirmation response.
  * @returns {Promise<object>} Harness controls and recorded calls.
  */
 export async function createUserscriptHarness(options = {}) {
@@ -48,6 +51,7 @@ export async function createUserscriptHarness(options = {}) {
 
     const eventHandlers = new Map();
     const animationFrames = [];
+    const timers = [];
     const requests = [];
     const storage = new Map(Object.entries(options.settings || {}));
     const sidebarRegistrationResult = { tabLabel, tabPane };
@@ -55,6 +59,9 @@ export async function createUserscriptHarness(options = {}) {
     const deferredSidebarRegistration = new Promise(resolve => {
         resolveSidebarRegistration = resolve;
     });
+    let mapExtent = options.mapExtent || [99, 9, 115, 15];
+    let zoomLevel = options.zoomLevel ?? 14;
+    let nextTimerIdentifier = 1;
 
     const sdk = {
         Events: {
@@ -85,8 +92,8 @@ export async function createUserscriptHarness(options = {}) {
                 }
             }),
             addLayer: vi.fn(),
-            getMapExtent: vi.fn(() => [99, 9, 115, 15]),
-            getZoomLevel: vi.fn(() => 14),
+            getMapExtent: vi.fn(() => [...mapExtent]),
+            getZoomLevel: vi.fn(() => zoomLevel),
             redrawLayer: vi.fn(),
             removeAllFeaturesFromLayer: vi.fn(),
             removeFeatureFromLayer: vi.fn(),
@@ -141,6 +148,11 @@ export async function createUserscriptHarness(options = {}) {
         GM_xmlhttpRequest: gmXmlHttpRequest,
         SDK_INITIALIZED: Promise.resolve(),
         alert: vi.fn(),
+        clearTimeout: vi.fn(identifier => {
+            const timer = timers.find(item => item.identifier === identifier);
+            if (timer) timer.cancelled = true;
+        }),
+        confirm: vi.fn(() => options.confirmResult ?? true),
         cancelAnimationFrame: vi.fn(identifier => {
             const frame = animationFrames.find(item => item.identifier === identifier);
             if (frame) frame.cancelled = true;
@@ -149,6 +161,12 @@ export async function createUserscriptHarness(options = {}) {
         requestAnimationFrame: vi.fn(callback => {
             const identifier = animationFrames.length + 1;
             animationFrames.push({ callback, cancelled: false, identifier });
+            return identifier;
+        }),
+        setTimeout: vi.fn(callback => {
+            const identifier = nextTimerIdentifier;
+            nextTimerIdentifier += 1;
+            timers.push({ callback, cancelled: false, identifier });
             return identifier;
         })
     });
@@ -201,6 +219,19 @@ export async function createUserscriptHarness(options = {}) {
     }
 
     /**
+     * Runs all queued userscript timers once.
+     *
+     * @returns {Promise<void>}
+     */
+    async function flushTimers() {
+        const pending = timers.splice(0);
+        for (const timer of pending) {
+            if (!timer.cancelled) timer.callback();
+        }
+        await settleMicrotasks();
+    }
+
+    /**
      * Clicks the load button for a named province.
      *
      * @param {string} [provinceName="สมุทรปราการ"] Province display name.
@@ -209,6 +240,20 @@ export async function createUserscriptHarness(options = {}) {
     function startLoad(provinceName = "สมุทรปราการ") {
         const input = document.getElementById("tb-province-input");
         const button = document.getElementById("tb-load-btn");
+        input.value = provinceName;
+        button.click();
+        return requests.at(-1);
+    }
+
+    /**
+     * Clicks the secondary whole-province load button.
+     *
+     * @param {string} [provinceName="สมุทรปราการ"] Province display name.
+     * @returns {object|undefined} Created GM request, if a download was needed.
+     */
+    function startFullLoad(provinceName = "สมุทรปราการ") {
+        const input = document.getElementById("tb-province-input");
+        const button = document.getElementById("tb-load-full-btn");
         input.value = provinceName;
         button.click();
         return requests.at(-1);
@@ -242,6 +287,7 @@ export async function createUserscriptHarness(options = {}) {
         emitSdkEvent,
         eventHandlers,
         flushAnimationFrames,
+        flushTimers,
         getWmeSdk,
         gmGetValue,
         gmSetValue,
@@ -250,13 +296,21 @@ export async function createUserscriptHarness(options = {}) {
         resolveSidebarRegistration: () => resolveSidebarRegistration(sidebarRegistrationResult),
         respondJson,
         runNextAnimationFrame,
+        setMapExtent: extent => {
+            mapExtent = [...extent];
+        },
+        setZoomLevel: value => {
+            zoomLevel = value;
+        },
         sdk,
         settleMicrotasks,
         source,
         startLoad,
+        startFullLoad,
         storage,
         tabLabel,
         tabPane,
+        timers,
         window
     };
 }

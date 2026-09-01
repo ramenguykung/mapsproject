@@ -108,9 +108,13 @@
     const LAYER_Z_INDEX = 9999;
     const LABEL_MIN_ZOOM = 12;
     const LABEL_FEATURE_LIMIT = 1200;
+    const MIN_BOUNDARY_LOAD_ZOOM = 12;
+    const VIEWPORT_PADDING_RATIO = 0.15;
+    const COVERAGE_REFRESH_DEBOUNCE_MS = 180;
     const FRAME_BUDGET_MS = 8;
     const MAX_PREPARED_FEATURES_PER_FRAME = 20;
     const MAX_SDK_FEATURES_PER_BATCH = 20;
+    const MAX_SDK_COORDINATES_PER_BATCH = 10000;
     const PROGRESS_UPDATE_INTERVAL_MS = 100;
     const GEOJSON_CACHE_LIMIT = 2;
     const OUTLINE_COLOR_STORAGE_KEY = "wme-th-tambon:outline-color";
@@ -129,6 +133,8 @@
      * @property {HTMLInputElement} provinceInput Province selector input.
      * @property {HTMLDataListElement} provinceList Province datalist.
      * @property {HTMLButtonElement} loadButton Load button.
+     * @property {HTMLButtonElement} fullLoadButton Whole-province load button.
+     * @property {HTMLButtonElement} loadCurrentButton Coverage action button.
      * @property {HTMLButtonElement} cancelButton Cancel button.
      * @property {HTMLButtonElement} clearButton Clear button.
      * @property {HTMLElement} status Status message element.
@@ -140,6 +146,9 @@
      * @property {HTMLInputElement} outlineOpacity Outline opacity control.
      * @property {HTMLInputElement} featureSearch Feature search control.
      * @property {HTMLSelectElement} districtSelect District selector.
+     * @property {HTMLElement} loadedStatus Persistent loaded-area status.
+     * @property {HTMLElement} coverageNotice Coverage notice container.
+     * @property {HTMLElement} coverageMessage Coverage notice message.
      */
 
     /**
@@ -169,13 +178,22 @@
      */
 
     /**
-     * @typedef {object} PendingPreparedArea
+     * @typedef {object} BoundaryBounds
+     * @property {number} minX Minimum longitude.
+     * @property {number} minY Minimum latitude.
+     * @property {number} maxX Maximum longitude.
+     * @property {number} maxY Maximum latitude.
+     */
+
+    /**
+     * @typedef {object} BoundaryIndexItem
      * @property {Record<string, unknown>} attributes Source feature properties.
-     * @property {SourceGeometry} geometry Source geometry used by the navigator.
      * @property {string} label Boundary label.
      * @property {string} pcode Stable administrative code.
      * @property {Array<import("geojson").Polygon>} polygonParts Atomic polygon geometries.
-     * @property {number} nextPartIndex Next polygon part to prepare.
+     * @property {number[]} polygonCoordinateCounts Coordinate count for each polygon part.
+     * @property {BoundaryBounds} bounds Full-resolution feature bounds.
+     * @property {PreparedSdkFeature[]|null} sdkFeatures Lazily prepared SDK features.
      */
 
     /**
@@ -184,16 +202,44 @@
      * @property {string} district District or Bangkok district name.
      * @property {string} searchLabel Disambiguated result label.
      * @property {string} searchText Normalized text used for matching.
-     * @property {SourceGeometry} geometry Source GeoJSON geometry.
-     * @property {{lon: number, lat: number}|null} center Cached WGS84 center.
-     * @property {boolean} centerResolved Whether center calculation has run.
+     * @property {BoundaryBounds} bounds Indexed WGS84 bounds.
      */
 
     /**
-     * @typedef {object} PreparedBoundaryData
-     * @property {PreparedSdkFeature[]} features Atomic SDK polygon features.
+     * @typedef {object} IndexedBoundaryData
+     * @property {BoundaryIndexItem[]} items Indexed source boundaries.
      * @property {Record<string, NavigatorEntry[]>} navigatorData Navigator data grouped by district.
      * @property {number} sourceFeatureCount Administrative area count.
+     */
+
+    /**
+     * @typedef {object} ProvinceSession
+     * @property {number} loadToken Token that created the session.
+     * @property {string} provinceKey Province key.
+     * @property {string} filename Province filename.
+     * @property {boolean} labelsEnabled Whether labels are enabled for this province.
+     * @property {BoundaryIndexItem[]} items Indexed source boundaries.
+     * @property {Record<string, NavigatorEntry[]>} navigatorData Navigator data grouped by district.
+     * @property {number} sourceFeatureCount Administrative area count.
+     * @property {Set<string>} loadedSourceIds Source PCode values committed to the layer.
+     * @property {Set<string>} loadedFeatureIds SDK feature IDs committed to the layer.
+     * @property {boolean} isFullProvinceLoaded Whether every source boundary is loaded.
+     * @property {(() => void)|null} removeMoveEndHandler SDK move-end cleanup function.
+     */
+
+    /**
+     * @typedef {object} RenderOperation
+     * @property {number} loadToken Active load token.
+     * @property {ProvinceSession} session Target province session.
+     * @property {BoundaryIndexItem[]} items Source items being added.
+     * @property {string[]} addedFeatureIds SDK IDs successfully added by this operation.
+     * @property {boolean} hadLoadedFeatures Whether the layer already contained committed features.
+     */
+
+    /**
+     * @typedef {object} SdkFeatureUnit
+     * @property {PreparedSdkFeature} feature SDK feature.
+     * @property {number} coordinateCount Full-resolution coordinate count.
      */
 
     /** @type {import("wme-sdk-typings").WmeSDK|null} */
@@ -213,6 +259,16 @@
     const geoJsonCache = new Map();
     /** @type {Record<string, NavigatorEntry[]>} */
     let currentProvinceData = {};
+    /** @type {ProvinceSession|null} */
+    let activeProvinceSession = null;
+    /** @type {RenderOperation|null} */
+    let activeRenderOperation = null;
+    /** @type {SidebarUi|null} */
+    let sidebarUi = null;
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    let coverageRefreshTimer = null;
+    /** @type {(() => void)|null} */
+    let removeZoomHandler = null;
     /** @type {OutlineSettings} */
     let outlineSettings = {
         color: DEFAULT_OUTLINE_COLOR,
@@ -295,7 +351,8 @@
                 </div>
 
                 <div style="margin-top: 15px;">
-                    <button id="tb-load-btn" class="btn btn-primary" style="width: 100%; margin-bottom: 8px;">โหลดข้อมูล</button>
+                    <button id="tb-load-btn" class="btn btn-primary" style="width: 100%; margin-bottom: 8px;">โหลดพื้นที่ในมุมมอง</button>
+                    <button id="tb-load-full-btn" class="btn btn-default" style="width: 100%; margin-bottom: 8px; font-size: 11px;">โหลดทั้งจังหวัด (ช้ากว่า)</button>
                     <button id="tb-cancel-btn" class="btn btn-warning" style="width: 100%; margin-bottom: 8px; display: none;">ยกเลิกการโหลด</button>
                     <button id="tb-clear-btn" class="btn btn-default" style="width: 100%;">ลบเส้นออก</button>
                 </div>
@@ -312,6 +369,11 @@
 
                 <hr style="margin: 15px 0;"/>
                 <div id="tb-status" style="font-size:11px; color:#666; text-align: center;">สถานะ: พร้อมใช้งาน</div>
+                <div id="tb-loaded-status" style="display:none; margin-top: 8px; padding: 5px 8px; border-radius: 10px; background: #e8f5e9; color: #2e7d32; font-size: 11px; text-align: center;"></div>
+                <div id="tb-coverage-notice" style="display:none; margin-top: 8px; padding: 8px; border: 1px solid #f0ad4e; border-radius: 4px; background: #fff8e1; font-size: 11px; text-align: center;">
+                    <div id="tb-coverage-message" style="margin-bottom: 6px;"></div>
+                    <button id="tb-load-current-btn" class="btn btn-primary" style="width: 100%; font-size: 11px;">โหลดขอบเขตบริเวณนี้</button>
+                </div>
                 <hr style="margin: 15px 0; border-color: #ccc;"/>
 
                 <div id="tb-navigator-container" style="display: none; padding-bottom: 10px;">
@@ -346,6 +408,9 @@
             ["LayerSwitcher.removeLayerCheckbox", sdk?.LayerSwitcher?.removeLayerCheckbox],
             ["Map.addLayer", sdk?.Map?.addLayer],
             ["Map.addFeaturesToLayer", sdk?.Map?.addFeaturesToLayer],
+            ["Map.getMapExtent", sdk?.Map?.getMapExtent],
+            ["Map.getZoomLevel", sdk?.Map?.getZoomLevel],
+            ["Map.removeFeaturesFromLayer", sdk?.Map?.removeFeaturesFromLayer],
             ["Map.removeLayer", sdk?.Map?.removeLayer],
             ["Map.redrawLayer", sdk?.Map?.redrawLayer],
             ["Map.setLayerVisibility", sdk?.Map?.setLayerVisibility],
@@ -504,6 +569,8 @@
             provinceInput: getRequiredElement("tb-province-input"),
             provinceList: getRequiredElement("tb-provinces-list"),
             loadButton: getRequiredElement("tb-load-btn"),
+            fullLoadButton: getRequiredElement("tb-load-full-btn"),
+            loadCurrentButton: getRequiredElement("tb-load-current-btn"),
             cancelButton: getRequiredElement("tb-cancel-btn"),
             clearButton: getRequiredElement("tb-clear-btn"),
             status: getRequiredElement("tb-status"),
@@ -514,12 +581,18 @@
             outlineColor: getRequiredElement("tb-outline-color"),
             outlineOpacity: getRequiredElement("tb-outline-opacity"),
             featureSearch: getRequiredElement("tb-feature-search"),
-            districtSelect: getRequiredElement("tb-district-select")
+            districtSelect: getRequiredElement("tb-district-select"),
+            loadedStatus: getRequiredElement("tb-loaded-status"),
+            coverageNotice: getRequiredElement("tb-coverage-notice"),
+            coverageMessage: getRequiredElement("tb-coverage-message")
         };
+        sidebarUi = ui;
         const {
             provinceInput,
             provinceList: datalist,
             loadButton: btnLoad,
+            fullLoadButton: btnLoadFull,
+            loadCurrentButton: btnLoadCurrent,
             cancelButton: btnCancel,
             clearButton: btnClear,
             status: statusDiv,
@@ -542,11 +615,11 @@
         const setLoadingState = loading => {
             loadState.isLoading = loading;
             provinceInput.disabled = loading;
-            btnLoad.disabled = loading;
-            btnClear.disabled = loading;
             featureSearch.disabled = loading;
             btnCancel.style.display = loading ? "block" : "none";
             btnCancel.disabled = !loading;
+            syncBoundaryActionControls();
+            if (!loading) updateCoverageUi();
         };
 
         /**
@@ -562,18 +635,18 @@
         };
 
         /**
-         * Cancels all active work and removes any partial layer.
+         * Cancels active work and rolls back only its partial SDK additions.
          *
          * @returns {void}
          */
         const cancelLoading = () => {
             loadState.token += 1;
             abortActiveRequest();
-            removeBoundaryLayer();
-            clearNavigator();
+            rollbackActiveRenderOperation();
             setLoadingState(false);
             resetProgressUi();
             statusDiv.innerText = "สถานะ: ยกเลิกการโหลดแล้ว";
+            updateCoverageUi();
         };
 
         setLoadingState(false);
@@ -584,11 +657,27 @@
             datalist.appendChild(option);
         });
 
-        btnLoad.addEventListener("click", () => {
+        /**
+         * Starts a selected-province viewport or full load.
+         *
+         * @param {"viewport"|"full"} mode Load mode.
+         * @returns {void}
+         */
+        const startSelectedLoad = mode => {
+            if (!isBoundaryLoadingAllowed()) {
+                updateCoverageUi();
+                return;
+            }
             const selectedName = provinceInput.value;
             const selectedKey = Object.keys(PROVINCES).find(key => PROVINCES[key].name === selectedName);
 
             if (selectedKey && PROVINCES[selectedKey]) {
+                if (
+                    mode === "full" &&
+                    !window.confirm("การโหลดทั้งจังหวัดอาจทำให้เบราว์เซอร์ค้างชั่วคราว ต้องการดำเนินการต่อหรือไม่?")
+                ) {
+                    return;
+                }
                 statusDiv.innerText = "⏳ กำลังดาวน์โหลด...";
                 progressContainer.style.display = "block";
                 progressBar.style.width = "0%";
@@ -596,7 +685,7 @@
                 etaText.innerText = "กำลังโหลด...";
                 setLoadingState(true);
 
-                loadBoundary(selectedKey, PROVINCES[selectedKey].file, statusDiv, {
+                loadBoundary(selectedKey, PROVINCES[selectedKey].file, mode, statusDiv, {
                     bar: progressBar,
                     text: progressText,
                     eta: etaText
@@ -606,6 +695,35 @@
             } else {
                 alert("กรุณาเลือกจังหวัดให้ถูกต้อง (ต้องตรงกับในรายการ)");
             }
+        };
+
+        btnLoad.addEventListener("click", () => {
+            startSelectedLoad("viewport");
+        });
+
+        btnLoadFull.addEventListener("click", () => {
+            startSelectedLoad("full");
+        });
+
+        btnLoadCurrent.addEventListener("click", () => {
+            if (!activeProvinceSession || !isBoundaryLoadingAllowed()) {
+                updateCoverageUi();
+                return;
+            }
+            statusDiv.innerText = "⏳ กำลังโหลดขอบเขตบริเวณนี้...";
+            progressContainer.style.display = "block";
+            progressBar.style.width = "0%";
+            progressText.innerText = "0%";
+            etaText.innerText = "กำลังโหลด...";
+            setLoadingState(true);
+            loadBoundary(
+                activeProvinceSession.provinceKey,
+                activeProvinceSession.filename,
+                "viewport",
+                statusDiv,
+                { bar: progressBar, text: progressText, eta: etaText },
+                () => setLoadingState(false)
+            );
         });
 
         btnCancel.addEventListener("click", () => {
@@ -616,11 +734,12 @@
         btnClear.addEventListener("click", () => {
             loadState.token += 1;
             abortActiveRequest();
-            removeBoundaryLayer();
-            clearNavigator();
+            rollbackActiveRenderOperation();
+            teardownProvinceSession();
             setLoadingState(false);
             statusDiv.innerText = "สถานะ: ลบเส้นแล้ว";
             progressContainer.style.display = "none";
+            updateCoverageUi();
         });
 
         districtSelect.addEventListener("change", () => {
@@ -651,6 +770,248 @@
             redrawBoundaryLayer();
         });
         outlineOpacity.addEventListener("change", persistOutlineSettings);
+
+        if (removeZoomHandler) removeZoomHandler();
+        removeZoomHandler = wmeSDK?.Events.on({
+            eventName: "wme-map-zoom-changed",
+            eventHandler: () => {
+                syncBoundaryActionControls();
+                scheduleCoverageRefresh();
+            }
+        }) || null;
+        syncBoundaryActionControls();
+        updateCoverageUi();
+    }
+
+    /**
+     * Returns whether the map is zoomed in far enough to start SDK ingestion.
+     *
+     * @returns {boolean} True at the configured loading zoom or higher.
+     */
+    function isBoundaryLoadingAllowed() {
+        return Boolean(wmeSDK && wmeSDK.Map.getZoomLevel() >= MIN_BOUNDARY_LOAD_ZOOM);
+    }
+
+    /**
+     * Synchronizes loading buttons with zoom and operation state.
+     *
+     * @returns {void}
+     */
+    function syncBoundaryActionControls() {
+        if (!sidebarUi) return;
+        const disabled = loadState.isLoading || !isBoundaryLoadingAllowed();
+        sidebarUi.loadButton.disabled = disabled;
+        sidebarUi.fullLoadButton.disabled = disabled;
+        sidebarUi.loadCurrentButton.disabled = disabled;
+    }
+
+    /**
+     * Updates the persistent loaded-boundary tag without regard to zoom.
+     *
+     * @returns {void}
+     */
+    function updateLoadedStatus() {
+        if (!sidebarUi) return;
+        if (!activeProvinceSession) {
+            sidebarUi.loadedStatus.style.display = "none";
+            sidebarUi.loadedStatus.textContent = "";
+            return;
+        }
+        sidebarUi.loadedStatus.style.display = "block";
+        sidebarUi.loadedStatus.textContent =
+            "โหลดแล้ว " + activeProvinceSession.loadedSourceIds.size +
+            "/" + activeProvinceSession.sourceFeatureCount + " พื้นที่";
+    }
+
+    /**
+     * Coalesces map movement and zoom events before checking coverage.
+     *
+     * @returns {void}
+     */
+    function scheduleCoverageRefresh() {
+        if (coverageRefreshTimer !== null) clearTimeout(coverageRefreshTimer);
+        coverageRefreshTimer = setTimeout(() => {
+            coverageRefreshTimer = null;
+            updateCoverageUi();
+        }, COVERAGE_REFRESH_DEBOUNCE_MS);
+    }
+
+    /**
+     * Shows a user-gated action only when visible source boundaries are missing.
+     *
+     * @returns {void}
+     */
+    function updateCoverageUi() {
+        updateLoadedStatus();
+        syncBoundaryActionControls();
+        if (!sidebarUi) return;
+
+        const session = activeProvinceSession;
+        if (!session || session.isFullProvinceLoaded || loadState.isLoading) {
+            sidebarUi.coverageNotice.style.display = "none";
+            return;
+        }
+
+        const visibleItems = getViewportItems(session, 0);
+        const hasUnloadedVisibleItem = visibleItems.some(item => !session.loadedSourceIds.has(item.pcode));
+        if (!hasUnloadedVisibleItem) {
+            sidebarUi.coverageNotice.style.display = "none";
+            return;
+        }
+
+        sidebarUi.coverageNotice.style.display = "block";
+        if (!isBoundaryLoadingAllowed()) {
+            sidebarUi.coverageMessage.textContent =
+                "กรุณาซูมเข้าอย่างน้อยระดับ 12 เพื่อโหลดขอบเขตเพิ่มเติม";
+            sidebarUi.loadCurrentButton.style.display = "none";
+        } else {
+            sidebarUi.coverageMessage.textContent = "มุมมองนี้มีขอบเขตที่ยังไม่ได้โหลด";
+            sidebarUi.loadCurrentButton.style.display = "block";
+        }
+    }
+
+    /**
+     * Converts the current WME extent into an optionally padded bounds object.
+     *
+     * @param {number} paddingRatio Padding relative to viewport width and height.
+     * @returns {BoundaryBounds|null} Valid extent or null.
+     */
+    function getCurrentMapBounds(paddingRatio) {
+        if (!wmeSDK) return null;
+        const extent = wmeSDK.Map.getMapExtent();
+        if (!Array.isArray(extent) || extent.length < 4) return null;
+        const [left, bottom, right, top] = extent.map(Number);
+        if (![left, bottom, right, top].every(Number.isFinite)) return null;
+        const padX = Math.max(right - left, 0) * paddingRatio;
+        const padY = Math.max(top - bottom, 0) * paddingRatio;
+        return {
+            minX: left - padX,
+            minY: bottom - padY,
+            maxX: right + padX,
+            maxY: top + padY
+        };
+    }
+
+    /**
+     * Tests whether two WGS84 bounds intersect.
+     *
+     * @param {BoundaryBounds} first First bounds.
+     * @param {BoundaryBounds} second Second bounds.
+     * @returns {boolean} True when the bounds overlap.
+     */
+    function boundsIntersect(first, second) {
+        return !(
+            first.maxX < second.minX ||
+            first.minX > second.maxX ||
+            first.maxY < second.minY ||
+            first.minY > second.maxY
+        );
+    }
+
+    /**
+     * Selects source items intersecting the current viewport.
+     *
+     * @param {ProvinceSession} session Active province session.
+     * @param {number} paddingRatio Viewport padding ratio.
+     * @returns {BoundaryIndexItem[]} Intersecting items.
+     */
+    function getViewportItems(session, paddingRatio) {
+        const viewportBounds = getCurrentMapBounds(paddingRatio);
+        if (!viewportBounds) return [];
+        return session.items.filter(item => boundsIntersect(item.bounds, viewportBounds));
+    }
+
+    /**
+     * Returns unloaded source items intersecting the padded viewport.
+     *
+     * @param {ProvinceSession} session Active province session.
+     * @param {number} paddingRatio Viewport padding ratio.
+     * @returns {BoundaryIndexItem[]} Unloaded viewport items.
+     */
+    function getUnloadedViewportItems(session, paddingRatio) {
+        return getViewportItems(session, paddingRatio)
+            .filter(item => !session.loadedSourceIds.has(item.pcode));
+    }
+
+    /**
+     * Returns every source item not yet committed to the SDK layer.
+     *
+     * @param {ProvinceSession} session Active province session.
+     * @returns {BoundaryIndexItem[]} Unloaded items.
+     */
+    function getUnloadedItems(session) {
+        return session.items.filter(item => !session.loadedSourceIds.has(item.pcode));
+    }
+
+    /**
+     * Makes indexed province data available to navigation and coverage checks.
+     *
+     * @param {ProvinceSession} session Prepared session.
+     * @returns {void}
+     */
+    function activateProvinceSession(session) {
+        activeProvinceSession = session;
+        currentProvinceData = session.navigatorData;
+        updateDistrictDropdown();
+        if (wmeSDK) {
+            session.removeMoveEndHandler = wmeSDK.Events.on({
+                eventName: "wme-map-move-end",
+                eventHandler: scheduleCoverageRefresh
+            });
+        }
+        updateCoverageUi();
+    }
+
+    /**
+     * Rolls back features added by the current render operation only.
+     *
+     * @returns {void}
+     */
+    function rollbackActiveRenderOperation() {
+        const operation = activeRenderOperation;
+        activeRenderOperation = null;
+        if (!operation) return;
+
+        if (wmeSDK && isBoundaryLayerCreated && operation.addedFeatureIds.length > 0) {
+            try {
+                wmeSDK.Map.removeFeaturesFromLayer({
+                    layerName: LAYER_NAME,
+                    featureIds: operation.addedFeatureIds
+                });
+            } catch (error) {
+                console.warn("WME Tambon: partial boundary rollback failed", error);
+            }
+        }
+        if (!operation.hadLoadedFeatures) isBoundaryLayerReady = false;
+        updateLoadedStatus();
+    }
+
+    /**
+     * Removes active province state, events, and SDK geometry.
+     *
+     * @returns {void}
+     */
+    function teardownProvinceSession() {
+        if (coverageRefreshTimer !== null) {
+            clearTimeout(coverageRefreshTimer);
+            coverageRefreshTimer = null;
+        }
+        if (activeProvinceSession?.removeMoveEndHandler) {
+            try {
+                activeProvinceSession.removeMoveEndHandler();
+            } catch (error) {
+                console.warn("WME Tambon: map event cleanup failed", error);
+            }
+        }
+        activeProvinceSession = null;
+        activeRenderOperation = null;
+        removeBoundaryLayer();
+        clearNavigator();
+        if (sidebarUi) {
+            sidebarUi.loadedStatus.style.display = "none";
+            sidebarUi.loadedStatus.textContent = "";
+            sidebarUi.coverageNotice.style.display = "none";
+        }
     }
 
     /**
@@ -730,90 +1091,87 @@
     }
 
     /**
-     * Downloads one province and starts complete SDK layer rendering.
+     * Ensures a province is indexed and renders a user-selected target.
      *
      * @param {string} provinceKey Province key.
      * @param {string} filename GeoJSON filename.
+     * @param {"viewport"|"full"} mode Load mode.
      * @param {HTMLElement} statusDiv Status element.
      * @param {ProgressUi} ui Progress elements.
      * @param {Function} onComplete Completion callback.
      * @returns {void}
      */
-    function loadBoundary(provinceKey, filename, statusDiv, ui, onComplete) {
+    function loadBoundary(provinceKey, filename, mode, statusDiv, ui, onComplete) {
         const loadToken = ++loadState.token;
-        const url = DATA_BASE_URL + filename;
-
         abortActiveRequest();
-        removeBoundaryLayer();
-        clearNavigator();
 
-        fetchGeoJson(url)
-            .then(async geoJsonData => {
+        void (async () => {
+            try {
+                let session = activeProvinceSession;
+                if (!session || session.provinceKey !== provinceKey || session.filename !== filename) {
+                    teardownProvinceSession();
+                    statusDiv.innerText = "⏳ กำลังดาวน์โหลด...";
+                    const geoJsonData = await fetchGeoJson(DATA_BASE_URL + filename);
+                    if (loadToken !== loadState.token) return;
+
+                    const rawFeatures = getSourceFeatures(geoJsonData);
+                    if (rawFeatures.length === 0) {
+                        throw new Error("ไม่พบข้อมูลพื้นที่ในไฟล์");
+                    }
+
+                    statusDiv.innerText = "กำลังจัดทำดัชนีขอบเขต...";
+                    const indexed = await prepareBoundaryIndex(rawFeatures, provinceKey, ui, loadToken);
+                    if (!indexed || loadToken !== loadState.token) return;
+
+                    session = {
+                        loadToken,
+                        provinceKey,
+                        filename,
+                        labelsEnabled: indexed.sourceFeatureCount <= LABEL_FEATURE_LIMIT,
+                        items: indexed.items,
+                        navigatorData: indexed.navigatorData,
+                        sourceFeatureCount: indexed.sourceFeatureCount,
+                        loadedSourceIds: new Set(),
+                        loadedFeatureIds: new Set(),
+                        isFullProvinceLoaded: false,
+                        removeMoveEndHandler: null
+                    };
+                    activateProvinceSession(session);
+                }
+
+                const targetItems = mode === "full"
+                    ? getUnloadedItems(session)
+                    : getUnloadedViewportItems(session, VIEWPORT_PADDING_RATIO);
+                if (targetItems.length === 0) {
+                    ui.bar.style.width = "100%";
+                    ui.text.innerText = "100%";
+                    ui.eta.innerText = "เสร็จสิ้น";
+                    statusDiv.innerText = mode === "full" || session.isFullProvinceLoaded
+                        ? `✅ แสดงผลครบทั้งจังหวัด (${session.sourceFeatureCount} พื้นที่)`
+                        : "ไม่พบขอบเขตที่ยังไม่ได้โหลดในมุมมองนี้";
+                    return;
+                }
+
+                const completed = await renderBoundaryItems(session, targetItems, ui, loadToken);
+                if (!completed || loadToken !== loadState.token) return;
+
+                ui.eta.innerText = "เสร็จสิ้น";
+                const labelSuffix = !session.labelsEnabled ? ", โหมดเร็ว: ปิดชื่อ" : "";
+                statusDiv.innerText = session.isFullProvinceLoaded
+                    ? `✅ แสดงผลครบทั้งจังหวัด (${session.sourceFeatureCount} พื้นที่${labelSuffix})`
+                    : `✅ โหลดพื้นที่ในมุมมองแล้ว (โหลดแล้ว ${session.loadedSourceIds.size}/${session.sourceFeatureCount} พื้นที่${labelSuffix})`;
+            } catch (error) {
                 if (loadToken !== loadState.token) return;
-                statusDiv.innerText = "กำลังประมวลผล...";
-                await drawCompleteBoundaryLayer(
-                    geoJsonData,
-                    provinceKey,
-                    statusDiv,
-                    ui,
-                    loadToken,
-                    onComplete
-                );
-            })
-            .catch(error => {
-                if (loadToken !== loadState.token) return;
-                removeBoundaryLayer();
-                clearNavigator();
+                rollbackActiveRenderOperation();
                 const message = error instanceof Error ? error.message : String(error);
                 statusDiv.innerText = "❌ ผิดพลาด: " + message;
-                if (typeof onComplete === "function") onComplete();
-            });
-    }
-
-    /**
-     * Prepares and inserts every source area without spatial filtering.
-     *
-     * @param {unknown} geoJsonData Province GeoJSON data.
-     * @param {string} provinceKey Province key.
-     * @param {HTMLElement} statusDiv Status element.
-     * @param {ProgressUi} ui Progress elements.
-     * @param {number} loadToken Active load token.
-     * @param {Function} onComplete Completion callback.
-     * @returns {Promise<void>}
-     */
-    async function drawCompleteBoundaryLayer(geoJsonData, provinceKey, statusDiv, ui, loadToken, onComplete) {
-        const rawFeatures = getSourceFeatures(geoJsonData);
-        const total = rawFeatures.length;
-
-        if (total === 0) {
-            statusDiv.innerText = "❌ ไม่พบข้อมูลพื้นที่ในไฟล์";
-            ui.bar.style.width = "0%";
-            ui.text.innerText = "0%";
-            ui.eta.innerText = "--:--";
-            if (typeof onComplete === "function") onComplete();
-            return;
-        }
-
-        const labelsEnabled = total <= LABEL_FEATURE_LIMIT;
-        const prepared = await prepareBoundaryData(rawFeatures, provinceKey, labelsEnabled, ui, loadToken);
-        if (!prepared || loadToken !== loadState.token) return;
-
-        createBoundaryLayer(labelsEnabled);
-        const completed = await addPreparedFeatures(prepared.features, ui, loadToken);
-        if (!completed || loadToken !== loadState.token || !wmeSDK) return;
-
-        isBoundaryLayerReady = true;
-        wmeSDK.Map.setLayerVisibility({
-            layerName: LAYER_NAME,
-            visibility: isBoundaryLayerEnabled
-        });
-        wmeSDK.Map.redrawLayer({ layerName: LAYER_NAME });
-
-        currentProvinceData = prepared.navigatorData;
-        updateDistrictDropdown();
-        ui.eta.innerText = "เสร็จสิ้น";
-        statusDiv.innerText = `✅ แสดงผลเรียบร้อย (${prepared.sourceFeatureCount} พื้นที่${!labelsEnabled ? ", โหมดเร็ว: ปิดชื่อ" : ""})`;
-        if (typeof onComplete === "function") onComplete();
+            } finally {
+                if (loadToken === loadState.token) {
+                    updateCoverageUi();
+                    if (typeof onComplete === "function") onComplete();
+                }
+            }
+        })();
     }
 
     /**
@@ -829,26 +1187,24 @@
     }
 
     /**
-     * Converts all source areas into atomic SDK polygons in cooperative frames.
+     * Builds a full-resolution spatial index in cooperative frames.
      *
      * @param {SourceFeature[]} rawFeatures Source GeoJSON features.
      * @param {string} provinceKey Province key.
-     * @param {boolean} labelsEnabled Whether labels are enabled.
      * @param {ProgressUi} ui Progress elements.
      * @param {number} loadToken Active load token.
-     * @returns {Promise<PreparedBoundaryData|null>} Prepared data or null after cancellation.
+     * @returns {Promise<IndexedBoundaryData|null>} Indexed data or null after cancellation.
      */
-    async function prepareBoundaryData(rawFeatures, provinceKey, labelsEnabled, ui, loadToken) {
-        /** @type {PreparedSdkFeature[]} */
-        const features = [];
+    async function prepareBoundaryIndex(rawFeatures, provinceKey, ui, loadToken) {
+        /** @type {BoundaryIndexItem[]} */
+        const items = [];
+        const indexedPcodes = new Set();
         /** @type {Record<string, NavigatorEntry[]>} */
         const navigatorData = {};
         const total = rawFeatures.length;
         const startTime = nowMs();
         let lastProgressUpdateAt = -Infinity;
         let index = 0;
-        /** @type {PendingPreparedArea|null} */
-        let pendingArea = null;
 
         /**
          * Updates the existing progress messages without excessive DOM work.
@@ -882,54 +1238,39 @@
                 preparedInFrame < MAX_PREPARED_FEATURES_PER_FRAME &&
                 nowMs() - frameStart < FRAME_BUDGET_MS
             ) {
-                if (!pendingArea) {
-                    const sourceFeature = rawFeatures[index];
-                    if (!sourceFeature || typeof sourceFeature !== "object" || !sourceFeature.geometry) {
-                        throw new Error("Invalid GeoJSON feature at index " + index);
-                    }
-
-                    const attributes = sourceFeature.properties && typeof sourceFeature.properties === "object"
-                        ? sourceFeature.properties
-                        : {};
-                    const pcode = getPropertyString(attributes, "ADM3_PCODE") ||
-                        getPropertyString(attributes, "ADM2_PCODE");
-                    if (!pcode) {
-                        throw new Error("Missing PCode at index " + index);
-                    }
-
-                    pendingArea = {
-                        attributes,
-                        geometry: sourceFeature.geometry,
-                        label: resolveFeatureLabel(provinceKey, attributes),
-                        pcode,
-                        polygonParts: flattenPolygonGeometry(sourceFeature.geometry),
-                        nextPartIndex: 0
-                    };
-                    if (nowMs() - frameStart >= FRAME_BUDGET_MS) break;
+                const sourceFeature = rawFeatures[index];
+                if (!sourceFeature || typeof sourceFeature !== "object" || !sourceFeature.geometry) {
+                    throw new Error("Invalid GeoJSON feature at index " + index);
                 }
 
-                const partIndex = pendingArea.nextPartIndex;
-                features.push({
-                    id: provinceKey + "-" + pendingArea.pcode + "-" + partIndex,
-                    type: "Feature",
-                    geometry: pendingArea.polygonParts[partIndex],
-                    properties: {
-                        __tbLabel: labelsEnabled && partIndex === 0 ? pendingArea.label : ""
-                    }
-                });
-                pendingArea.nextPartIndex += 1;
-                preparedInFrame += 1;
-
-                if (pendingArea.nextPartIndex >= pendingArea.polygonParts.length) {
-                    addNavigatorEntry(
-                        navigatorData,
-                        provinceKey,
-                        pendingArea.attributes,
-                        pendingArea.geometry
-                    );
-                    pendingArea = null;
+                const attributes = sourceFeature.properties && typeof sourceFeature.properties === "object"
+                    ? sourceFeature.properties
+                    : {};
+                const pcode = getPropertyString(attributes, "ADM3_PCODE") ||
+                    getPropertyString(attributes, "ADM2_PCODE");
+                if (!pcode) throw new Error("Missing PCode at index " + index);
+                if (indexedPcodes.has(pcode)) {
+                    preparedInFrame += 1;
                     index += 1;
+                    continue;
                 }
+
+                const polygonParts = flattenPolygonGeometry(sourceFeature.geometry);
+                const measurement = measurePolygonParts(polygonParts);
+                const item = {
+                    attributes,
+                    label: resolveFeatureLabel(provinceKey, attributes),
+                    pcode,
+                    polygonParts,
+                    polygonCoordinateCounts: measurement.coordinateCounts,
+                    bounds: measurement.bounds,
+                    sdkFeatures: null
+                };
+                indexedPcodes.add(pcode);
+                items.push(item);
+                preparedInFrame += 1;
+                addNavigatorEntry(navigatorData, provinceKey, attributes, measurement.bounds);
+                index += 1;
             }
 
             updateProgress(index >= total);
@@ -941,37 +1282,180 @@
         });
 
         return {
-            features,
+            items,
             navigatorData,
-            sourceFeatureCount: total
+            sourceFeatureCount: items.length
         };
     }
 
     /**
-     * Adds all prepared SDK polygons in bounded synchronous batches.
+     * Measures full-resolution polygon parts for indexing and SDK batching.
      *
-     * @param {PreparedSdkFeature[]} features SDK features.
+     * @param {Array<import("geojson").Polygon>} polygonParts Polygon parts.
+     * @returns {{bounds: BoundaryBounds, coordinateCounts: number[]}} Measurement.
+     */
+    function measurePolygonParts(polygonParts) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        const coordinateCounts = polygonParts.map(part => {
+            let count = 0;
+            for (const ring of part.coordinates) {
+                if (!Array.isArray(ring) || ring.length === 0) {
+                    throw new Error("Invalid GeoJSON geometry: Polygon");
+                }
+                for (const coordinate of ring) {
+                    const x = Number(coordinate?.[0]);
+                    const y = Number(coordinate?.[1]);
+                    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+                        throw new Error("Invalid GeoJSON coordinate");
+                    }
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x > maxX) maxX = x;
+                    if (y > maxY) maxY = y;
+                    count += 1;
+                }
+            }
+            return count;
+        });
+
+        if (![minX, minY, maxX, maxY].every(Number.isFinite)) {
+            throw new Error("Invalid GeoJSON geometry: Polygon");
+        }
+        return { bounds: { minX, minY, maxX, maxY }, coordinateCounts };
+    }
+
+    /**
+     * Adds selected full-resolution boundaries through bounded SDK calls.
+     *
+     * @param {ProvinceSession} session Active province session.
+     * @param {BoundaryIndexItem[]} items Unloaded source items.
      * @param {ProgressUi} ui Progress elements.
      * @param {number} loadToken Active load token.
-     * @returns {Promise<boolean>} True after every feature is added.
+     * @returns {Promise<boolean>} True after every selected feature is committed.
      */
-    async function addPreparedFeatures(features, ui, loadToken) {
+    async function renderBoundaryItems(session, items, ui, loadToken) {
         if (!wmeSDK) throw new Error("WME Tambon: SDK is unavailable");
-        ui.eta.innerText = "กำลังวาดเส้นลงแผนที่...";
+        if (!isBoundaryLayerCreated) createBoundaryLayer(session.labelsEnabled);
 
-        for (let index = 0; index < features.length; index += MAX_SDK_FEATURES_PER_BATCH) {
+        const units = createSdkFeatureUnits(session, items);
+        const batches = createSdkFeatureBatches(units);
+        const operation = {
+            loadToken,
+            session,
+            items,
+            addedFeatureIds: [],
+            hadLoadedFeatures: session.loadedFeatureIds.size > 0
+        };
+        activeRenderOperation = operation;
+        ui.eta.innerText = "กำลังวาดเส้นลงแผนที่...";
+        let completedUnits = 0;
+
+        for (let index = 0; index < batches.length; index += 1) {
             if (loadToken !== loadState.token) return false;
-            const batch = features.slice(index, index + MAX_SDK_FEATURES_PER_BATCH);
+            const batch = batches[index];
             wmeSDK.Map.addFeaturesToLayer({
                 layerName: LAYER_NAME,
-                features: batch
+                features: batch.map(unit => unit.feature)
             });
-            if (index + MAX_SDK_FEATURES_PER_BATCH < features.length) {
-                await waitForNextFrame();
-            }
+            operation.addedFeatureIds.push(...batch.map(unit => String(unit.feature.id)));
+            completedUnits += batch.length;
+            const pct = Math.floor((completedUnits / units.length) * 100);
+            ui.bar.style.width = pct + "%";
+            ui.text.innerText = "กำลังวาดเส้น: " + pct + "% (" + completedUnits + "/" + units.length + ")";
+            if (index + 1 < batches.length) await waitForNextFrame();
         }
 
-        return loadToken === loadState.token;
+        if (loadToken !== loadState.token) return false;
+        for (const item of items) session.loadedSourceIds.add(item.pcode);
+        for (const featureId of operation.addedFeatureIds) session.loadedFeatureIds.add(featureId);
+        session.isFullProvinceLoaded = session.loadedSourceIds.size >= session.sourceFeatureCount;
+        activeRenderOperation = null;
+
+        if (!isBoundaryLayerReady) {
+            isBoundaryLayerReady = true;
+            wmeSDK.Map.setLayerVisibility({
+                layerName: LAYER_NAME,
+                visibility: isBoundaryLayerEnabled
+            });
+            wmeSDK.Map.redrawLayer({ layerName: LAYER_NAME });
+        }
+        updateLoadedStatus();
+        return true;
+    }
+
+    /**
+     * Lazily creates SDK features and pairs them with coordinate costs.
+     *
+     * @param {ProvinceSession} session Active province session.
+     * @param {BoundaryIndexItem[]} items Source items.
+     * @returns {SdkFeatureUnit[]} SDK feature units.
+     */
+    function createSdkFeatureUnits(session, items) {
+        /** @type {SdkFeatureUnit[]} */
+        const units = [];
+        const selectedFeatureIds = new Set();
+        for (const item of items) {
+            if (!item.sdkFeatures) {
+                item.sdkFeatures = item.polygonParts.map((geometry, partIndex) => ({
+                    id: session.provinceKey + "-" + item.pcode + "-" + partIndex,
+                    type: "Feature",
+                    geometry,
+                    properties: {
+                        __tbLabel: session.labelsEnabled && partIndex === 0 ? item.label : ""
+                    }
+                }));
+            }
+            item.sdkFeatures.forEach((feature, partIndex) => {
+                const featureId = String(feature.id);
+                if (session.loadedFeatureIds.has(featureId) || selectedFeatureIds.has(featureId)) return;
+                selectedFeatureIds.add(featureId);
+                units.push({
+                    feature,
+                    coordinateCount: item.polygonCoordinateCounts[partIndex]
+                });
+            });
+        }
+        return units;
+    }
+
+    /**
+     * Groups SDK feature units by polygon and coordinate budgets.
+     *
+     * @param {SdkFeatureUnit[]} units SDK feature units.
+     * @returns {SdkFeatureUnit[][]} SDK batches.
+     */
+    function createSdkFeatureBatches(units) {
+        /** @type {SdkFeatureUnit[][]} */
+        const batches = [];
+        /** @type {SdkFeatureUnit[]} */
+        let batch = [];
+        let batchCoordinateCount = 0;
+
+        const flush = () => {
+            if (batch.length === 0) return;
+            batches.push(batch);
+            batch = [];
+            batchCoordinateCount = 0;
+        };
+
+        for (const unit of units) {
+            if (
+                batch.length >= MAX_SDK_FEATURES_PER_BATCH ||
+                (batch.length > 0 && batchCoordinateCount + unit.coordinateCount > MAX_SDK_COORDINATES_PER_BATCH)
+            ) {
+                flush();
+            }
+            batch.push(unit);
+            batchCoordinateCount += unit.coordinateCount;
+            if (
+                batch.length >= MAX_SDK_FEATURES_PER_BATCH ||
+                batchCoordinateCount >= MAX_SDK_COORDINATES_PER_BATCH
+            ) {
+                flush();
+            }
+        }
+        flush();
+        return batches;
     }
 
     /**
@@ -1048,49 +1532,6 @@
                 setTimeout(resolve, 0);
             }
         });
-    }
-
-    /**
-     * Computes WGS84 bounds for a GeoJSON geometry when a user warps.
-     *
-     * @param {any} geometry GeoJSON geometry.
-     * @returns {{minX: number, minY: number, maxX: number, maxY: number}|null} Geometry bounds.
-     */
-    function computeGeometryBounds(geometry) {
-        if (!geometry) return null;
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-
-        function updateCoord(coord) {
-            if (!Array.isArray(coord) || coord.length < 2) return;
-            const x = Number(coord[0]), y = Number(coord[1]);
-            if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-            if (x < minX) minX = x;
-            if (y < minY) minY = y;
-            if (x > maxX) maxX = x;
-            if (y > maxY) maxY = y;
-        }
-
-        function walkCoordinates(coords) {
-            if (!Array.isArray(coords) || coords.length === 0) return;
-            if (typeof coords[0] === "number") {
-                updateCoord(coords);
-                return;
-            }
-            for (let i = 0; i < coords.length; i += 1) walkCoordinates(coords[i]);
-        }
-
-        function walkGeometry(g) {
-            if (!g) return;
-            if (g.type === "GeometryCollection" && Array.isArray(g.geometries)) {
-                for (let i = 0; i < g.geometries.length; i += 1) walkGeometry(g.geometries[i]);
-                return;
-            }
-            walkCoordinates(g.coordinates);
-        }
-
-        walkGeometry(geometry);
-        if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
-        return { minX, minY, maxX, maxY };
     }
 
     /**
@@ -1215,10 +1656,10 @@
      * @param {Record<string, NavigatorEntry[]>} navigatorData Navigator data under construction.
      * @param {string} provinceKey Province key.
      * @param {Record<string, unknown>} attributes Source feature properties.
-     * @param {SourceGeometry} geometry Source feature geometry kept for lazy center calculation.
+     * @param {BoundaryBounds} bounds Indexed source feature bounds.
      * @returns {void}
      */
-    function addNavigatorEntry(navigatorData, provinceKey, attributes, geometry) {
+    function addNavigatorEntry(navigatorData, provinceKey, attributes, bounds) {
         const district = getPropertyString(attributes, "ADM2_TH");
         if (!district) return;
 
@@ -1233,9 +1674,7 @@
             district,
             searchLabel,
             searchText: normalizeSearchText([district, tambon, searchLabel].filter(Boolean).join(" ")),
-            geometry,
-            center: null,
-            centerResolved: false
+            bounds
         });
     }
 
@@ -1337,24 +1776,16 @@
     }
 
     /**
-     * Calculates an area's center once and warps to it.
+     * Uses indexed bounds to center the map without walking geometry again.
      *
      * @param {NavigatorEntry} entry Selected navigator entry.
      * @returns {void}
      */
     function goToFeature(entry) {
-        if (!entry.centerResolved) {
-            const bounds = computeGeometryBounds(entry.geometry);
-            entry.center = bounds
-                ? {
-                    lon: (bounds.minX + bounds.maxX) / 2,
-                    lat: (bounds.minY + bounds.maxY) / 2
-                }
-                : null;
-            entry.centerResolved = true;
-        }
-
-        if (entry.center) goToLocation(entry.center.lon, entry.center.lat);
+        goToLocation(
+            (entry.bounds.minX + entry.bounds.maxX) / 2,
+            (entry.bounds.minY + entry.bounds.maxY) / 2
+        );
     }
 
     /**

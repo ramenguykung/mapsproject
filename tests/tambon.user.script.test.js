@@ -10,24 +10,24 @@ import {
 import { createUserscriptHarness } from "./helpers/userscript-harness.js";
 
 const openHarnesses = [];
-const V201_FIXED_PANE_TEXT = [
+const FIXED_PANE_TEXT = [
     "ขอบเขตการปกครอง",
     "คำแนะนำ:",
     "กรุงเทพฯ: แสดงเขต",
     "ต่างจังหวัด: แสดงตำบล, อำเภอ",
     "จังหวัด:",
-    "โหลดข้อมูล",
+    "สีเส้น:",
+    "ความทึบของเส้น:",
+    "โหลดพื้นที่ในมุมมอง",
+    "โหลดทั้งจังหวัด (ช้ากว่า)",
     "ยกเลิกการโหลด",
     "ลบเส้นออก",
     "0%",
     "--:--",
     "สถานะ: พร้อมใช้งาน",
+    "โหลดขอบเขตบริเวณนี้",
     "วาร์ปปป",
     "-- เลือกอำเภอ/เขต --"
-];
-const APPROVED_FIXED_COPY_ADDITIONS = [
-    "สีเส้น:",
-    "ความทึบของเส้น:"
 ];
 
 /**
@@ -93,6 +93,90 @@ async function completeDownloadedLoad(harness, fixture, provinceName = "สม�
     await harness.settleMicrotasks();
 }
 
+/**
+ * Creates polygons whose coordinate counts exercise the SDK batch budget.
+ *
+ * @returns {object} GeoJSON fixture.
+ */
+function createCoordinateBudgetFixture() {
+    const coordinateCounts = [6000, 6000, 11001, 5];
+    return {
+        type: "FeatureCollection",
+        features: coordinateCounts.map((coordinateCount, index) => {
+            const coordinates = Array.from({ length: coordinateCount - 1 }, (_, pointIndex) => [
+                100 + index + ((pointIndex % 100) * 0.00001),
+                10 + (Math.floor(pointIndex / 100) * 0.00001)
+            ]);
+            coordinates.push(coordinates[0]);
+            return {
+                type: "Feature",
+                properties: {
+                    ADM2_TH: "เมืองงบประมาณ",
+                    ADM3_PCODE: "TH98" + String(index).padStart(4, "0"),
+                    ADM3_TH: "พื้นที่งบประมาณ " + index
+                },
+                geometry: { type: "Polygon", coordinates: [coordinates] }
+            };
+        })
+    };
+}
+
+/**
+ * Creates one visible boundary plus boundaries just inside and outside 15% padding.
+ *
+ * @returns {object} GeoJSON fixture.
+ */
+function createViewportPaddingFixture() {
+    /** @type {Array<[string, number, string]>} */
+    const definitions = [
+        ["TH970001", 100.2, "มองเห็น"],
+        ["TH970002", 101.1, "ในระยะเผื่อ"],
+        ["TH970003", 101.16, "นอกระยะเผื่อ"]
+    ];
+    return {
+        type: "FeatureCollection",
+        features: definitions.map(([pcode, minX, name]) => ({
+            type: "Feature",
+            properties: {
+                ADM2_TH: "เมืองระยะเผื่อ",
+                ADM3_PCODE: pcode,
+                ADM3_TH: name
+            },
+            geometry: {
+                type: "Polygon",
+                coordinates: [[
+                    [minX, 10.2],
+                    [minX + 0.02, 10.2],
+                    [minX + 0.02, 10.4],
+                    [minX, 10.4],
+                    [minX, 10.2]
+                ]]
+            }
+        }))
+    };
+}
+
+/**
+ * Creates one nearby polygon and one distant multipart polygon for rollback tests.
+ *
+ * @param {number} [partCount=25] Distant polygon part count.
+ * @returns {object} GeoJSON fixture.
+ */
+function createSeparatedMultipartFixture(partCount = 25) {
+    const fixture = createBoundaryFixture();
+    fixture.features[1].geometry.coordinates = Array.from({ length: partCount }, (_, index) => {
+        const lon = 110 + (index * 0.01);
+        return [[
+            [lon, 10],
+            [lon + 0.005, 10],
+            [lon + 0.005, 10.005],
+            [lon, 10.005],
+            [lon, 10]
+        ]];
+    });
+    return fixture;
+}
+
 afterEach(() => {
     for (const harness of openHarnesses.splice(0)) {
         harness.close();
@@ -128,9 +212,6 @@ describe("SDK bootstrap and preserved interface", () => {
         for (const forbiddenSymbol of [
             "dangerouslyAddFeaturesToLayerWithoutValidation",
             "setLayerOpacity",
-            "wme-map-move-end",
-            "getMapExtent",
-            "removeFeaturesFromLayer",
             "viewportSession",
             "refreshViewportFeatures",
             "visibleIds"
@@ -139,16 +220,13 @@ describe("SDK bootstrap and preserved interface", () => {
         }
     });
 
-    test("preserves the exact v2.0.1 interface copy plus three approved additions", async () => {
+    test("preserves the reviewed interface copy for hybrid loading", async () => {
         const harness = await createHarness();
         const manifest = getFixedInterfaceCopy(harness);
 
         expect(harness.tabLabel.textContent).toBe("🇹🇭");
         expect(harness.tabLabel.title).toBe("ขอบเขตการปกครอง");
-        expect(manifest.paneText.filter(value => !APPROVED_FIXED_COPY_ADDITIONS.includes(value)))
-            .toEqual(V201_FIXED_PANE_TEXT);
-        expect(manifest.paneText.filter(value => APPROVED_FIXED_COPY_ADDITIONS.includes(value)))
-            .toEqual(APPROVED_FIXED_COPY_ADDITIONS);
+        expect(manifest.paneText).toEqual(FIXED_PANE_TEXT);
         expect(manifest.placeholders).toEqual([
             { id: "tb-province-input", value: "-- พิมพ์หรือคลิกเพื่อเลือก --" },
             { id: "tb-feature-search", value: "ค้นหาอำเภอ/เขต/ตำบล" }
@@ -228,40 +306,170 @@ describe("SDK bootstrap and preserved interface", () => {
     });
 });
 
-describe("full boundary rendering", () => {
-    test("adds every Polygon and MultiPolygon part without viewport filtering", async () => {
-        const harness = await createHarness();
+describe("hybrid boundary rendering", () => {
+    test("indexes the province but initially adds only padded-viewport boundaries", async () => {
+        const harness = await createHarness({ mapExtent: [99.5, 9.5, 102.5, 12.5] });
         harness.startLoad();
         await harness.respondJson(createBoundaryFixture());
         await harness.flushAnimationFrames();
 
         const addedFeatures = harness.sdk.Map.addFeaturesToLayer.mock.calls
             .flatMap(([args]) => args.features);
-        expect(addedFeatures).toHaveLength(3);
+        expect(addedFeatures).toHaveLength(1);
         expect(addedFeatures.every(feature => feature.geometry.type === "Polygon")).toBe(true);
-        expect(new Set(addedFeatures.map(feature => feature.id)).size).toBe(3);
-        expect(addedFeatures.map(feature => feature.id)).toEqual([
-            "1-TH990101-0",
-            "1-TH990201-0",
-            "1-TH990201-1"
-        ]);
-        expect(addedFeatures.map(feature => feature.properties.__tbLabel)).toEqual([
-            "กลาง, เมืองหนึ่ง",
-            "บ้านใหม่, เมืองสอง",
-            ""
-        ]);
+        expect(addedFeatures.map(feature => feature.id)).toEqual(["1-TH990101-0"]);
+        expect(addedFeatures[0].properties.__tbLabel).toBe("กลาง, เมืองหนึ่ง");
 
-        expect(harness.sdk.Map.getMapExtent).not.toHaveBeenCalled();
+        expect(harness.sdk.Map.getMapExtent).toHaveBeenCalled();
         const subscribedEvents = harness.sdk.Events.on.mock.calls.map(([args]) => args.eventName);
         expect(subscribedEvents).not.toContain("wme-map-move");
-        expect(subscribedEvents).not.toContain("wme-map-move-end");
+        expect(subscribedEvents).toContain("wme-map-move-end");
+        expect(subscribedEvents).toContain("wme-map-zoom-changed");
 
         expect(harness.sdk.LayerSwitcher.addLayerCheckbox).toHaveBeenCalledWith({
             isChecked: true,
             name: "Thailand Boundary Overlay"
         });
         expect(getElementText(harness.document.getElementById("tb-status")))
-            .toBe("✅ แสดงผลเรียบร้อย (2 พื้นที่)");
+            .toBe("✅ โหลดพื้นที่ในมุมมองแล้ว (โหลดแล้ว 1/2 พื้นที่)");
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 1/2 พื้นที่");
+    });
+
+    test("uses exactly fifteen-percent viewport padding for initial selection", async () => {
+        const harness = await createHarness({ mapExtent: [100, 10, 101, 11] });
+        await completeDownloadedLoad(harness, createViewportPaddingFixture());
+
+        const addedIds = harness.sdk.Map.addFeaturesToLayer.mock.calls
+            .flatMap(([args]) => args.features)
+            .map(feature => feature.id);
+        expect(addedIds).toEqual(["1-TH970001-0", "1-TH970002-0"]);
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 2/3 พื้นที่");
+    });
+
+    test("prompts after movement and accumulates a new zone only after user input", async () => {
+        const harness = await createHarness({ mapExtent: [99.5, 9.5, 102.5, 12.5] });
+        await completeDownloadedLoad(harness, createBoundaryFixture());
+        harness.sdk.Map.addFeaturesToLayer.mockClear();
+        const requestCount = harness.requests.length;
+
+        harness.setMapExtent([109.5, 9.5, 114.5, 14.5]);
+        harness.emitSdkEvent("wme-map-move-end");
+        expect(harness.window.setTimeout.mock.calls.at(-1)[1]).toBe(180);
+        await harness.flushTimers();
+
+        expect(harness.sdk.Map.addFeaturesToLayer).not.toHaveBeenCalled();
+        expect(harness.document.getElementById("tb-coverage-notice").style.display).toBe("block");
+        expect(getElementText(harness.document.getElementById("tb-coverage-message")))
+            .toBe("มุมมองนี้มีขอบเขตที่ยังไม่ได้โหลด");
+
+        harness.document.getElementById("tb-load-current-btn").click();
+        await harness.flushAnimationFrames();
+        await harness.settleMicrotasks();
+
+        const addedIds = harness.sdk.Map.addFeaturesToLayer.mock.calls
+            .flatMap(([args]) => args.features)
+            .map(feature => feature.id);
+        expect(addedIds).toEqual(["1-TH990201-0", "1-TH990201-1"]);
+        expect(harness.requests).toHaveLength(requestCount);
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 2/2 พื้นที่");
+        expect(harness.document.getElementById("tb-coverage-notice").style.display).toBe("none");
+
+        harness.sdk.Map.addFeaturesToLayer.mockClear();
+        harness.setMapExtent([99.5, 9.5, 102.5, 12.5]);
+        harness.emitSdkEvent("wme-map-move-end");
+        await harness.flushTimers();
+        expect(harness.sdk.Map.addFeaturesToLayer).not.toHaveBeenCalled();
+    });
+
+    test("deduplicates indexed source PCodes and generated SDK feature IDs", async () => {
+        const harness = await createHarness();
+        const fixture = createBoundaryFixture();
+        fixture.features = [fixture.features[0], JSON.parse(JSON.stringify(fixture.features[0]))];
+
+        await completeDownloadedLoad(harness, fixture);
+
+        const addedIds = harness.sdk.Map.addFeaturesToLayer.mock.calls
+            .flatMap(([args]) => args.features)
+            .map(feature => feature.id);
+        expect(addedIds).toEqual(["1-TH990101-0"]);
+        expect(new Set(addedIds).size).toBe(addedIds.length);
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 1/1 พื้นที่");
+    });
+
+    test("blocks new loads below zoom 12 while retaining boundaries and the loaded tag", async () => {
+        const harness = await createHarness({
+            mapExtent: [99.5, 9.5, 102.5, 12.5],
+            zoomLevel: 12
+        });
+        await completeDownloadedLoad(harness, createBoundaryFixture());
+        const layer = harness.sdk.Map.addLayer.mock.calls[0][0];
+        const loadedFeature = harness.sdk.Map.addFeaturesToLayer.mock.calls[0][0].features[0];
+        harness.sdk.Map.addFeaturesToLayer.mockClear();
+        harness.sdk.Map.removeLayer.mockClear();
+
+        harness.setMapExtent([109.5, 9.5, 114.5, 14.5]);
+        harness.setZoomLevel(11);
+        harness.emitSdkEvent("wme-map-zoom-changed");
+        await harness.flushTimers();
+
+        expect(harness.document.getElementById("tb-load-btn").disabled).toBe(true);
+        expect(harness.document.getElementById("tb-load-full-btn").disabled).toBe(true);
+        expect(harness.document.getElementById("tb-loaded-status").style.display).toBe("block");
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 1/2 พื้นที่");
+        expect(getElementText(harness.document.getElementById("tb-coverage-message")))
+            .toBe("กรุณาซูมเข้าอย่างน้อยระดับ 12 เพื่อโหลดขอบเขตเพิ่มเติม");
+        expect(harness.document.getElementById("tb-load-current-btn").style.display).toBe("none");
+        expect(harness.sdk.Map.removeLayer).not.toHaveBeenCalled();
+        expect(harness.sdk.Map.addFeaturesToLayer).not.toHaveBeenCalled();
+        expect(layer.styleContext.getLabel({ feature: loadedFeature, zoomLevel: 11 })).toBe("");
+
+        harness.setZoomLevel(12);
+        harness.emitSdkEvent("wme-map-zoom-changed");
+        await harness.flushTimers();
+        expect(harness.document.getElementById("tb-load-btn").disabled).toBe(false);
+        expect(harness.document.getElementById("tb-load-full-btn").disabled).toBe(false);
+        expect(harness.document.getElementById("tb-load-current-btn").style.display).toBe("block");
+    });
+
+    test("keeps whole-province loading secondary, confirmed, and deduplicated", async () => {
+        const harness = await createHarness({ mapExtent: [99.5, 9.5, 102.5, 12.5] });
+        await completeDownloadedLoad(harness, createBoundaryFixture());
+        harness.sdk.Map.addFeaturesToLayer.mockClear();
+        const requestCount = harness.requests.length;
+
+        harness.startFullLoad();
+        await harness.settleMicrotasks();
+        await harness.flushAnimationFrames();
+
+        expect(harness.window.confirm).toHaveBeenCalledOnce();
+        expect(harness.requests).toHaveLength(requestCount);
+        const addedIds = harness.sdk.Map.addFeaturesToLayer.mock.calls
+            .flatMap(([args]) => args.features)
+            .map(feature => feature.id);
+        expect(addedIds).toEqual(["1-TH990201-0", "1-TH990201-1"]);
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 2/2 พื้นที่");
+        expect(getElementText(harness.document.getElementById("tb-status")))
+            .toBe("✅ แสดงผลครบทั้งจังหวัด (2 พื้นที่)");
+        expect(harness.document.getElementById("tb-coverage-notice").style.display).toBe("none");
+    });
+
+    test("does not start whole-province loading when confirmation is declined", async () => {
+        const harness = await createHarness({ confirmResult: false });
+
+        harness.startFullLoad();
+        await harness.settleMicrotasks();
+
+        expect(harness.window.confirm).toHaveBeenCalledOnce();
+        expect(harness.requests).toHaveLength(0);
+        expect(harness.sdk.Map.addFeaturesToLayer).not.toHaveBeenCalled();
+        expect(getElementText(harness.document.getElementById("tb-status")))
+            .toBe("สถานะ: พร้อมใช้งาน");
     });
 
     test("does not reveal the layer until all feature batches complete", async () => {
@@ -338,23 +546,23 @@ describe("full boundary rendering", () => {
         expect(batchSizes.reduce((sum, size) => sum + size, 0)).toBe(61);
     });
 
-    test("prepares multipart areas in slices of at most twenty polygons", async () => {
+    test("keeps multipart SDK batches at or below twenty polygons", async () => {
         const harness = await createHarness();
-        harness.startLoad();
-        await harness.respondJson(createMultipartBoundaryFixture());
+        await completeDownloadedLoad(harness, createMultipartBoundaryFixture());
+        const batchSizes = harness.sdk.Map.addFeaturesToLayer.mock.calls
+            .map(([args]) => args.features.length);
+        expect(batchSizes).toEqual([20, 20, 14]);
+    });
 
-        let preparationFrameCount = 0;
-        while (harness.sdk.Map.addLayer.mock.calls.length === 0) {
-            expect(await harness.runNextAnimationFrame()).toBe(true);
-            preparationFrameCount += 1;
-            expect(preparationFrameCount).toBeLessThan(10);
-        }
-        expect(preparationFrameCount).toBeGreaterThanOrEqual(2);
+    test("caps SDK batches at ten thousand coordinates and isolates oversized polygons", async () => {
+        const harness = await createHarness();
+        await completeDownloadedLoad(harness, createCoordinateBudgetFixture());
 
-        await harness.flushAnimationFrames();
-        const addedFeatures = harness.sdk.Map.addFeaturesToLayer.mock.calls
-            .flatMap(([args]) => args.features);
-        expect(addedFeatures).toHaveLength(54);
+        const coordinateCounts = harness.sdk.Map.addFeaturesToLayer.mock.calls.map(([args]) => (
+            args.features.reduce((sum, feature) => sum + feature.geometry.coordinates[0].length, 0)
+        ));
+        expect(coordinateCounts).toEqual([6000, 6000, 11001, 5]);
+        expect(harness.sdk.Map.addFeaturesToLayer.mock.calls[2][0].features).toHaveLength(1);
     });
 
     test("uses the zoom threshold and correct Bangkok and provincial labels", async () => {
@@ -411,24 +619,27 @@ describe("cancellation and failure cleanup", () => {
             .toBe("สถานะ: ยกเลิกการโหลดแล้ว");
     });
 
-    test("removes a partial layer instead of silently skipping an SDK add failure", async () => {
+    test("rolls back successful batches when a later SDK add fails", async () => {
+        let addCallCount = 0;
         const harness = await createHarness({
             onAddFeatures: () => {
-                throw new Error("SDK rejected geometry");
+                addCallCount += 1;
+                if (addCallCount === 2) throw new Error("SDK rejected geometry");
             }
         });
         harness.startLoad();
-        await harness.respondJson(createBoundaryFixture());
+        await harness.respondJson(createLargeBoundaryFixture(25));
         await harness.flushAnimationFrames();
 
-        expect(harness.sdk.Map.removeLayer).toHaveBeenCalledWith({
-            layerName: "wme-thailand-tambon-boundary"
-        });
-        expect(harness.sdk.LayerSwitcher.removeLayerCheckbox).toHaveBeenCalledWith({
-            name: "Thailand Boundary Overlay"
-        });
+        const rollback = harness.sdk.Map.removeFeaturesFromLayer.mock.calls.at(-1)[0];
+        expect(rollback.layerName).toBe("wme-thailand-tambon-boundary");
+        expect(rollback.featureIds).toHaveLength(20);
+        expect(harness.sdk.Map.removeLayer).not.toHaveBeenCalled();
+        expect(harness.sdk.LayerSwitcher.removeLayerCheckbox).not.toHaveBeenCalled();
         expect(getElementText(harness.document.getElementById("tb-status")))
             .toMatch(/^❌ ผิดพลาด: /);
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 0/25 พื้นที่");
         expect(harness.sdk.Map.setLayerVisibility.mock.calls)
             .not.toContainEqual([{ layerName: "wme-thailand-tambon-boundary", visibility: true }]);
     });
@@ -449,15 +660,41 @@ describe("cancellation and failure cleanup", () => {
             .length;
         expect(insertedCount).toBeGreaterThan(0);
         expect(insertedCount).toBeLessThan(60);
-        expect(harness.sdk.Map.removeLayer).toHaveBeenCalledWith({
-            layerName: "wme-thailand-tambon-boundary"
-        });
-        expect(harness.sdk.LayerSwitcher.removeLayerCheckbox).toHaveBeenCalledWith({
-            name: "Thailand Boundary Overlay"
-        });
+        const rollback = harness.sdk.Map.removeFeaturesFromLayer.mock.calls.at(-1)[0];
+        expect(rollback.layerName).toBe("wme-thailand-tambon-boundary");
+        expect(rollback.featureIds).toHaveLength(insertedCount);
+        expect(harness.sdk.Map.removeLayer).not.toHaveBeenCalled();
+        expect(harness.sdk.LayerSwitcher.removeLayerCheckbox).not.toHaveBeenCalled();
         expect(harness.sdk.Map.setLayerVisibility.mock.calls.at(-1)[0].visibility).toBe(false);
         expect(getElementText(harness.document.getElementById("tb-status")))
             .toBe("สถานะ: ยกเลิกการโหลดแล้ว");
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 0/60 พื้นที่");
+    });
+
+    test("cancels a new zone without removing previously committed boundaries", async () => {
+        const harness = await createHarness({ mapExtent: [99.5, 9.5, 102.5, 12.5] });
+        await completeDownloadedLoad(harness, createSeparatedMultipartFixture());
+        const committedId = harness.sdk.Map.addFeaturesToLayer.mock.calls[0][0].features[0].id;
+        harness.sdk.Map.addFeaturesToLayer.mockClear();
+        harness.sdk.Map.removeFeaturesFromLayer.mockClear();
+
+        harness.setMapExtent([109.5, 9.5, 111, 11]);
+        harness.emitSdkEvent("wme-map-move-end");
+        await harness.flushTimers();
+        harness.document.getElementById("tb-load-current-btn").click();
+        await harness.settleMicrotasks();
+        expect(harness.sdk.Map.addFeaturesToLayer).toHaveBeenCalledOnce();
+
+        harness.document.getElementById("tb-cancel-btn").click();
+        await harness.flushAnimationFrames();
+
+        const rolledBackIds = harness.sdk.Map.removeFeaturesFromLayer.mock.calls.at(-1)[0].featureIds;
+        expect(rolledBackIds).toHaveLength(20);
+        expect(rolledBackIds).not.toContain(committedId);
+        expect(getElementText(harness.document.getElementById("tb-loaded-status")))
+            .toBe("โหลดแล้ว 1/2 พื้นที่");
+        expect(harness.sdk.Map.removeLayer).not.toHaveBeenCalled();
     });
 
     test("rejects unsupported geometry before creating a layer", async () => {
@@ -544,6 +781,35 @@ describe("layer lifecycle and cache", () => {
         });
         expect(search.value).toBe("");
         expect(harness.document.getElementById("tb-navigator-container").style.display).toBe("none");
+        expect(harness.document.getElementById("tb-loaded-status").style.display).toBe("none");
+        expect(harness.document.getElementById("tb-coverage-notice").style.display).toBe("none");
+        expect(harness.eventHandlers.get("wme-map-move-end") || []).toHaveLength(0);
+        expect(getElementText(harness.document.getElementById("tb-status")))
+            .toBe("สถานะ: ลบเส้นแล้ว");
+    });
+
+    test("clear remains available and tears down active SDK insertion", async () => {
+        const harness = await createHarness();
+        harness.startLoad();
+        await harness.respondJson(createLargeBoundaryFixture());
+
+        while (harness.sdk.Map.addFeaturesToLayer.mock.calls.length === 0) {
+            expect(await harness.runNextAnimationFrame()).toBe(true);
+        }
+        const clearButton = harness.document.getElementById("tb-clear-btn");
+        expect(clearButton.disabled).toBe(false);
+
+        clearButton.click();
+        const addCallCountAfterClear = harness.sdk.Map.addFeaturesToLayer.mock.calls.length;
+        await harness.flushAnimationFrames();
+
+        expect(harness.sdk.Map.addFeaturesToLayer).toHaveBeenCalledTimes(addCallCountAfterClear);
+        expect(harness.sdk.Map.removeFeaturesFromLayer).toHaveBeenCalledOnce();
+        expect(harness.sdk.Map.removeLayer).toHaveBeenCalledWith({
+            layerName: "wme-thailand-tambon-boundary"
+        });
+        expect(harness.eventHandlers.get("wme-map-move-end") || []).toHaveLength(0);
+        expect(harness.document.getElementById("tb-loaded-status").style.display).toBe("none");
         expect(getElementText(harness.document.getElementById("tb-status")))
             .toBe("สถานะ: ลบเส้นแล้ว");
     });
