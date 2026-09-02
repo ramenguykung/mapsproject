@@ -1,9 +1,28 @@
 import { readFile } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { JSDOM } from "jsdom";
 import { vi } from "vitest";
 
-const SCRIPT_PATH = fileURLToPath(new URL("../../tambon.user.script.js", import.meta.url));
+const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+const DEFAULT_SCRIPT_PATH = fileURLToPath(new URL("../../tambon.user.script.js", import.meta.url));
+
+/**
+ * Resolves the userscript under test.
+ *
+ * `TAMBON_USERSCRIPT_PATH` is intentionally resolved from the repository root so
+ * release verification can use the generated artifact without changing the
+ * behavioral test suite.
+ *
+ * @returns {string} Absolute userscript path.
+ */
+function getUserscriptPath() {
+    const configuredPath = process.env.TAMBON_USERSCRIPT_PATH;
+    if (!configuredPath) return DEFAULT_SCRIPT_PATH;
+    return isAbsolute(configuredPath)
+        ? configuredPath
+        : resolve(PROJECT_ROOT, configuredPath);
+}
 
 /**
  * Lets pending promise continuations finish without advancing animation frames.
@@ -34,7 +53,8 @@ async function settleMicrotasks(turns = 6) {
  * @returns {Promise<object>} Harness controls and recorded calls.
  */
 export async function createUserscriptHarness(options = {}) {
-    const source = await readFile(SCRIPT_PATH, "utf8");
+    const scriptPath = getUserscriptPath();
+    const source = await readFile(scriptPath, "utf8");
     const dom = new JSDOM("<!doctype html><html><body></body></html>", {
         pretendToBeVisual: true,
         runScripts: "outside-only",
@@ -304,6 +324,7 @@ export async function createUserscriptHarness(options = {}) {
         },
         sdk,
         settleMicrotasks,
+        scriptPath,
         source,
         startLoad,
         startFullLoad,
