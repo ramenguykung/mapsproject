@@ -19,7 +19,7 @@
     'use strict';
 
     const DATA_BASE_URL = "https://wazeth.github.io/mapsproject/geojson/";
-    const SCRIPT_ID = "wme-th-tambon-tab-v3";
+    const SCRIPT_ID = "wme-th-tambon-tab-v2";
     const SCRIPT_TITLE = "ขอบเขตการปกครอง";
 
     // รายชื่อจังหวัด

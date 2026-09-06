@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Thailand Tambon
 // @namespace    https://github.com/wazeth/
-// @version      2.1
+// @version      2.0
 // @description  แสดงขอบเขตตำบล
 // @author       Waze Thailand
 // @match        https://*.waze.com/*/editor*
