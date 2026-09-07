@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,7 +6,9 @@ import { expect, test } from "vitest";
 
 const ROOT = dirname(fileURLToPath(new URL("../tambon.user.script.js", import.meta.url)));
 const SCRIPT_SOURCE = readFileSync(join(ROOT, "tambon.user.script.js"), "utf8");
-const REFERENCED_FILES = [...SCRIPT_SOURCE.matchAll(/file:\s*"([^"]+)"/g)].map(match => match[1]);
+const DATA_BASE_URL = "https://wazeth.github.io/mapsproject/geojson/";
+const REFERENCED_FILES = [...SCRIPT_SOURCE.matchAll(/file:\s*"([^"]+)"/g)]
+    .map(match => new URL(match[1], DATA_BASE_URL).href);
 const PROVINCE_ROWS = [...SCRIPT_SOURCE.matchAll(
     /"(\d+)":\s*\{\s*name:\s*"([^"]+)",\s*file:\s*"([^"]+)"\s*\}/g
 )].map(match => ({ key: match[1], name: match[2], file: match[3] }));
@@ -35,7 +37,7 @@ function validateRing(ring, counters) {
     counters.rings += 1;
 }
 
-test("all mapped provinces have complete SDK-compatible geometry", { timeout: 60000 }, () => {
+test("all mapped provinces have complete SDK-compatible geometry", { timeout: 180000 }, async () => {
     expect(REFERENCED_FILES).toHaveLength(77);
     expect(new Set(REFERENCED_FILES).size).toBe(77);
 
@@ -45,10 +47,11 @@ test("all mapped provinces have complete SDK-compatible geometry", { timeout: 60
         sourceAreas: 0
     };
 
-    for (const filename of REFERENCED_FILES) {
-        const path = join(ROOT, "geojson", filename);
-        if (!existsSync(path)) throw new Error(`Missing ${filename}`);
-        const data = JSON.parse(readFileSync(path, "utf8"));
+    for (const url of REFERENCED_FILES) {
+        const filename = new URL(url).pathname.split("/").pop();
+        const response = await fetch(url, { signal: AbortSignal.timeout(15000) });
+        if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
+        const data = await response.json();
         if (!Array.isArray(data.features)) throw new Error(`${filename} has no features`);
         const provinceCodes = new Set();
 
