@@ -307,6 +307,29 @@ describe("SDK bootstrap and preserved interface", () => {
 });
 
 describe("hybrid boundary rendering", () => {
+    test("keeps the visual boundary from intercepting native segment selection", async () => {
+        const harness = await createHarness({
+            configureSdk: sdk => sdk.Map.getLayerZIndex.mockReturnValue(7123)
+        });
+        await completeDownloadedLoad(harness, createBoundaryFixture());
+
+        expect(harness.sdk.Map.getLayerZIndex).toHaveBeenCalledWith({
+            layerName: "segments"
+        });
+        expect(harness.sdk.Map.setLayerZIndex).toHaveBeenCalledWith({
+            layerName: "wme-thailand-tambon-boundary",
+            zIndex: 7122
+        });
+
+        const layer = harness.sdk.Map.addLayer.mock.calls[0][0];
+        expect(layer.styleRules[0].style).toMatchObject({
+            fill: false,
+            fillOpacity: 0,
+            labelSelect: false,
+            pointerEvents: "none"
+        });
+    });
+
     test("indexes the province but initially adds only padded-viewport boundaries", async () => {
         const harness = await createHarness({ mapExtent: [99.5, 9.5, 102.5, 12.5] });
         harness.startLoad();

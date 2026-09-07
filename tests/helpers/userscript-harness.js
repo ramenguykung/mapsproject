@@ -112,6 +112,7 @@ export async function createUserscriptHarness(options = {}) {
                 }
             }),
             addLayer: vi.fn(),
+            getLayerZIndex: vi.fn(({ layerName }) => layerName === "segments" ? 6000 : 0),
             getMapExtent: vi.fn(() => [...mapExtent]),
             getZoomLevel: vi.fn(() => zoomLevel),
             redrawLayer: vi.fn(),

@@ -105,7 +105,7 @@
 
     const LAYER_NAME = "wme-thailand-tambon-boundary";
     const LAYER_CHECKBOX_NAME = "Thailand Boundary Overlay";
-    const LAYER_Z_INDEX = 9999;
+    const NATIVE_SEGMENT_LAYER_NAME = "segments";
     const LABEL_MIN_ZOOM = 12;
     const LABEL_FEATURE_LIMIT = 1200;
     const MIN_BOUNDARY_LOAD_ZOOM = 12;
@@ -408,6 +408,7 @@
             ["LayerSwitcher.removeLayerCheckbox", sdk?.LayerSwitcher?.removeLayerCheckbox],
             ["Map.addLayer", sdk?.Map?.addLayer],
             ["Map.addFeaturesToLayer", sdk?.Map?.addFeaturesToLayer],
+            ["Map.getLayerZIndex", sdk?.Map?.getLayerZIndex],
             ["Map.getMapExtent", sdk?.Map?.getMapExtent],
             ["Map.getZoomLevel", sdk?.Map?.getZoomLevel],
             ["Map.removeFeaturesFromLayer", sdk?.Map?.removeFeaturesFromLayer],
@@ -1577,6 +1578,7 @@
                     strokeColor: "${getStrokeColor}",
                     strokeOpacity: "${getStrokeOpacity}",
                     strokeWidth: 2,
+                    fill: false,
                     fillColor: "#FF0000",
                     fillOpacity: 0,
                     label: "${getLabel}",
@@ -1587,6 +1589,7 @@
                     labelOutlineWidth: 3,
                     fontWeight: "bold",
                     labelAlign: "cm",
+                    labelSelect: false,
                     pointerEvents: "none"
                 }
             }]
@@ -1597,9 +1600,17 @@
         isBoundaryLayerEnabled = true;
 
         try {
+            // Ordinary WME clicks resolve the topmost map feature. Keep this visual-only
+            // overlay below roads so its polygons cannot mask native segment selection.
+            const segmentLayerZIndex = wmeSDK.Map.getLayerZIndex({
+                layerName: NATIVE_SEGMENT_LAYER_NAME
+            });
+            if (!Number.isFinite(segmentLayerZIndex)) {
+                throw new Error("WME Tambon: Native segment layer z-index is unavailable");
+            }
             wmeSDK.Map.setLayerZIndex({
                 layerName: LAYER_NAME,
-                zIndex: LAYER_Z_INDEX
+                zIndex: segmentLayerZIndex - 1
             });
             wmeSDK.Map.setLayerVisibility({
                 layerName: LAYER_NAME,
